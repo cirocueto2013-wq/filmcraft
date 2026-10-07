@@ -248,6 +248,75 @@ fn save_and_open_roundtrip() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+#[test]
+fn opening_demo_cannot_overwrite_the_previous_project() {
+    let dir = crate::temp_dir().join(format!("fc-demo-project-switch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Production.fcproj");
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name": "Production cut", "width": 64, "height": 36})).unwrap();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let save = s.execute("file.save", json!({}));
+    let after = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+
+    assert!(before == after, "opening the demo and saving must preserve the previous project file");
+    assert!(save.is_err(), "a new demo project requires its own Save As path");
+    assert!(s.path.is_none());
+    assert!(s.render_program(0.1).is_some(), "the fresh demo retains working generator sources");
+}
+
+#[test]
+fn project_replacement_resets_media_and_offline_state() {
+    for command in ["file.newProject", "file.openDemoProject", "file.closeProject"] {
+        let mut s = demo();
+        s.path = Some("previous.fcproj".into());
+        s.loaded_schema = 1;
+        s.media.set_use_proxies(true);
+        s.offline.missing = vec![ItemId(999)];
+        s.offline.prompt = true;
+        let old_pool = s.media.clone();
+        let old_previews = s.previews.dir();
+
+        s.execute(command, json!({})).unwrap();
+
+        assert!(s.path.is_none(), "{command}: new project must not adopt the previous path");
+        assert!(!std::sync::Arc::ptr_eq(&old_pool, &s.media), "{command}: old decoder sources must not survive");
+        assert!(s.media.use_proxies(), "{command}: preserve the user's proxy preference");
+        assert!(s.offline.missing.is_empty() && !s.offline.prompt, "{command}: clear old missing-media prompts");
+        assert_eq!(s.loaded_schema, filmcraft_format::SCHEMA_VERSION, "{command}: new projects use the current schema");
+        assert_ne!(s.previews.dir(), old_previews, "{command}: previews must belong to the new project");
+        assert!(!s.history.can_undo() && !s.history.can_redo());
+        assert!(!s.is_dirty());
+    }
+}
+
+#[test]
+fn failed_save_as_preserves_the_project_and_its_original_path() {
+    let dir = crate::temp_dir().join(format!("fc-failed-save-as-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Original.fcproj");
+    let rejected = dir.join("Rejected.fcproj");
+    std::fs::create_dir_all(&rejected).unwrap();
+    let mut s = demo();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    s.execute("file.newBin", json!({"name": "Unsaved work"})).unwrap();
+    let before = s.project.clone();
+    let original_path = s.path.clone();
+    let revisions = (s.revision, s.saved_revision);
+    let result = s.execute("file.saveAs", json!({"path": rejected}));
+    std::fs::remove_dir_all(dir).unwrap();
+
+    assert!(result.is_err(), "saving over a directory must report the filesystem error");
+    assert!(*s.project == *before, "a failed Save As must not rename or mutate the document");
+    assert_eq!(s.path, original_path);
+    assert_eq!((s.revision, s.saved_revision), revisions);
+    assert!(s.is_dirty(), "unsaved work must remain dirty after a failed save");
+}
+
 /// Demo project with sync lock off on every track except V1/A1 (the A2 score spans every cut).
 fn demo_unlocked() -> Session {
     let mut s = demo();
