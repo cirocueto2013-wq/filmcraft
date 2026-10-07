@@ -146,6 +146,40 @@ fn wav_and_aiff_audio_only() {
 }
 
 #[test]
+fn invalid_export_allocations_are_rejected_before_rendering() {
+    let (project, sequence, _) = matte([1.0, 0.0, 0.0, 1.0], 64, 36, None);
+    for size in [(0, 36), (64, 0), (u32::MAX, u32::MAX), (16384, 16384)] {
+        let settings = ExportSettings { frame_size: Some(size), ..Default::default() };
+        assert!(settings.validate().is_err(), "{size:?}");
+        assert!(pipeline::Pipeline::new(project.clone(), sequence, &settings, false).is_err());
+    }
+    for scale in [0.0, -1.0, f32::NAN, f32::INFINITY, 1e30] {
+        let settings = ExportSettings { scale, ..Default::default() };
+        assert!(pipeline::Pipeline::new(project.clone(), sequence, &settings, false).is_err(), "scale {scale}");
+    }
+    for rate in [0, 384_001, u32::MAX] {
+        let settings = ExportSettings { audio: AudioSettings { sample_rate: Some(rate), ..Default::default() }, ..Default::default() };
+        assert!(settings.validate().is_err());
+    }
+}
+
+#[test]
+fn hostile_export_ranges_are_rejected_before_time_arithmetic() {
+    let (project, seq, sources) = matte([1.0, 0.0, 0.0, 1.0], 64, 36, None);
+    for range in [
+        TimeRange::new(Tick(i64::MIN), Tick(i64::MAX)),
+        TimeRange::new(Tick(i64::MAX), Tick(1)),
+        TimeRange::new(Tick::ZERO, Tick(-1)),
+        TimeRange::new(Tick::ZERO, Tick::ZERO),
+    ] {
+        let settings = ExportSettings { range: Some(range), ..Default::default() };
+        assert!(settings.validate().is_err());
+        assert!(export_range(&project, seq, &settings).is_err());
+        assert!(export(&project, seq, &settings, &sources, &Progress::default()).is_err());
+    }
+}
+
+#[test]
 fn frame_size_rate_and_scaling() {
     let (p, seq, m) = matte([1.0, 0.0, 0.0, 1.0], 320, 180, Some(-12.0));
     let dir = Scratch::new("size");
@@ -408,5 +442,78 @@ fn aac_bitrate_is_capped_for_low_sample_rates() {
     for (rate, ch) in [(22_050, 2), (16_000, 2), (8_000, 6), (48_000, 2)] {
         let enc = aac_factory(Format::H264, rate, ch, &s).expect("AAC is always available");
         assert!(enc.is_ok(), "{rate} Hz × {ch}: {:?}", enc.err());
+    }
+}
+
+#[test]
+fn extreme_bitrates_do_not_overflow_resolution() {
+    let s = ExportSettings { bitrate_kbps: u32::MAX, adaptive_bitrate: None, ..Default::default() };
+    let resolved = s.resolve(1920, 1080, FrameRate::FPS_30, 48_000);
+    assert_eq!(resolved.target_kbps, u32::MAX);
+    assert_eq!(resolved.max_kbps, u32::MAX);
+}
+
+#[test]
+fn incomplete_exports_preserve_the_destination_and_clean_staging_files() {
+    let dir = Scratch::new("atomic-output");
+    let path = dir.path("previous.mp4");
+    std::fs::write(&path, b"previous export").unwrap();
+    let settings = ExportSettings { path: path.clone(), ..Default::default() };
+    let mut output = Out::create(&settings).unwrap();
+    output.write_all(b"incomplete new export").unwrap();
+    output.flush().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+    drop(output);
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+
+    let mut output = Out::create(&settings).unwrap();
+    output.write_all(b"completed new export").unwrap();
+    assert_eq!(output.finish(&settings).unwrap(), 20);
+    assert_eq!(std::fs::read(&path).unwrap(), b"completed new export");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+
+    let destination = dir.path("directory");
+    std::fs::create_dir(&destination).unwrap();
+    let mut output = Out::create_path(&settings, &destination).unwrap();
+    output.write_all(b"cannot replace a directory").unwrap();
+    assert!(output.finish_path(&settings, &destination).is_err());
+    assert!(std::path::Path::new(&destination).is_dir());
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 2);
+}
+
+#[test]
+fn cancelling_an_export_keeps_a_previous_file() {
+    let (project, seq, sources) = matte([1.0, 0.0, 0.0, 1.0], 64, 36, None);
+    let dir = Scratch::new("cancel-overwrite");
+    let path = dir.path("previous.mp4");
+    std::fs::write(&path, b"previous export").unwrap();
+    let settings = ExportSettings { path: path.clone(), ..Default::default() };
+    let progress = Progress::default();
+    let mut exporter = Exporter::new(project, seq, &settings, &progress).unwrap();
+    assert!(matches!(exporter.step(&sources, &progress).unwrap(), Step::Progress));
+    progress.cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(exporter.step(&sources, &progress), Err(ExportError::Cancelled)));
+    drop(exporter);
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+}
+
+#[test]
+fn aac_presentation_duration_trims_the_last_access_unit() {
+    let (project, seq, sources) = matte([1.0, 0.0, 0.0, 1.0], 64, 36, Some(-18.0));
+    let dir = Scratch::new("aac-tail");
+    let path = dir.path("exact.mp4");
+    let rate = FrameRate::FPS_24;
+    let settings = ExportSettings { path: path.clone(), range: Some(TimeRange::new(rate.tick_of(1), rate.tick_of(7))), ..Default::default() };
+    export(&project, seq, &settings, &sources, &Progress::default()).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let file = filmcraft_isobmff::open(bytes).unwrap();
+    let audio = &file.tracks[file.track_of_kind(filmcraft_isobmff::TrackKind::Audio).unwrap()];
+    assert_eq!(file.timescale, 48000);
+    assert_eq!(audio.edits[0].segment_duration, 14000);
+    assert!(audio.duration > 14000, "coded AAC includes priming and padding");
+    if let Some(probe) = ffprobe_json(&["-show_streams", "-select_streams", "a:0"], &path) {
+        assert_eq!(probe["streams"][0]["duration_ts"], 14000);
     }
 }

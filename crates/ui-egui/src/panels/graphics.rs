@@ -1203,14 +1203,24 @@ pub fn properties(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 ParamValue::Text(s) => s,
                 _ => String::new(),
             };
-            let before = s.clone();
+            let mut edit = None;
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
-                let r = ui.add(egui::TextEdit::multiline(&mut s).desired_rows(2).desired_width(ui.available_width() - 8.0).font(Tokens::ui(12.0)));
+                let r = ui.add(
+                    egui::TextEdit::multiline(&mut s)
+                        .id_salt(("graphics-source-text", clip.0, l))
+                        .desired_rows(2)
+                        .desired_width(ui.available_width() - 8.0)
+                        .font(Tokens::ui(12.0)),
+                );
                 cx.autos.push(("graphics.sourceText".into(), r.rect, "Source Text".into()));
+                let merge = crate::widgets::text_edit_merge(ui, &r);
+                if r.changed() {
+                    edit = Some(merge);
+                }
             });
-            if s != before {
-                cx.actions.push(("graphics.setText".into(), json!({"clip": clip.0, "layer": l, "text": s, "merge": true})));
+            if let Some(merge) = edit {
+                cx.actions.push(("graphics.setText".into(), json!({"clip": clip.0, "layer": l, "text": s, "merge": merge})));
             }
             let family = match pv(e, "font", mt) {
                 ParamValue::Text(f) => f,

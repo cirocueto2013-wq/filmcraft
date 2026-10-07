@@ -1,4 +1,15 @@
 use super::*;
+
+#[test]
+fn invalid_preview_scales_are_rejected_without_allocating() {
+    let mut s = Session::default();
+    s.execute("file.newSequence", serde_json::json!({"width":160,"height":90})).unwrap();
+    for scale in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::MAX] {
+        assert!(s.render_program(scale).is_none());
+        assert!(s.render_program_working(scale).is_none());
+    }
+    assert_eq!(s.render_program(0.5).unwrap().w, 80);
+}
 use serde_json::json;
 
 fn demo() -> Session {
@@ -93,6 +104,38 @@ fn slide_moves_linked_audio_with_the_video() {
     let a = q.audio_tracks[0].items.iter().find(|i| i.link == v.link).unwrap();
     assert_eq!(nv.start, v.start + s.sequence_rate().tick_of(5));
     assert_eq!((a.start, a.source_in), (nv.start, nv.source_in), "linked audio slides too and stays in sync");
+}
+
+#[test]
+fn sequence_parameters_are_bounded_and_failed_changes_are_atomic() {
+    let mut s = demo();
+    let before = (*s.project).clone();
+    let history = s.history.undo.len();
+    for command in ["file.newSequence", "sequence.settings"] {
+        for params in [
+            json!({"width":0}),
+            json!({"height":0}),
+            json!({"sampleRate":0}),
+            json!({"width":4_294_967_360_u64}),
+            json!({"height":u64::MAX}),
+            json!({"sampleRate":u64::MAX}),
+            json!({"width":-1}),
+            json!({"width":1.5}),
+            json!({"width":16384,"height":16384}),
+            json!({"fps":1001}),
+            json!({"sampleRate":384001}),
+        ] {
+            assert!(s.execute(command, params.clone()).is_err(), "{command} {params}");
+            assert_eq!(*s.project, before);
+            assert_eq!(s.history.undo.len(), history);
+        }
+    }
+    for params in [json!({"video":u64::MAX}), json!({"audio":u64::MAX}), json!({"video":257}), json!({"audio":-1})] {
+        assert!(s.execute("file.newSequence", params.clone()).is_err(), "{params}");
+        assert_eq!(*s.project, before);
+    }
+    s.execute("file.newSequence", json!({"width":7680,"height":4320,"video":0,"audio":0})).unwrap();
+    assert_eq!(s.active_sequence().unwrap().settings.width, 7680, "standard 8K remains supported");
 }
 
 #[test]
@@ -246,6 +289,75 @@ fn save_and_open_roundtrip() {
     // media re-created from generator refs
     assert!(t.render_program(0.1).is_some());
     std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn opening_demo_cannot_overwrite_the_previous_project() {
+    let dir = crate::temp_dir().join(format!("fc-demo-project-switch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Production.fcproj");
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name": "Production cut", "width": 64, "height": 36})).unwrap();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let save = s.execute("file.save", json!({}));
+    let after = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+
+    assert!(before == after, "opening the demo and saving must preserve the previous project file");
+    assert!(save.is_err(), "a new demo project requires its own Save As path");
+    assert!(s.path.is_none());
+    assert!(s.render_program(0.1).is_some(), "the fresh demo retains working generator sources");
+}
+
+#[test]
+fn project_replacement_resets_media_and_offline_state() {
+    for command in ["file.newProject", "file.openDemoProject", "file.closeProject"] {
+        let mut s = demo();
+        s.path = Some("previous.fcproj".into());
+        s.loaded_schema = 1;
+        s.media.set_use_proxies(true);
+        s.offline.missing = vec![ItemId(999)];
+        s.offline.prompt = true;
+        let old_pool = s.media.clone();
+        let old_previews = s.previews.dir();
+
+        s.execute(command, json!({})).unwrap();
+
+        assert!(s.path.is_none(), "{command}: new project must not adopt the previous path");
+        assert!(!std::sync::Arc::ptr_eq(&old_pool, &s.media), "{command}: old decoder sources must not survive");
+        assert!(s.media.use_proxies(), "{command}: preserve the user's proxy preference");
+        assert!(s.offline.missing.is_empty() && !s.offline.prompt, "{command}: clear old missing-media prompts");
+        assert_eq!(s.loaded_schema, filmcraft_format::SCHEMA_VERSION, "{command}: new projects use the current schema");
+        assert_ne!(s.previews.dir(), old_previews, "{command}: previews must belong to the new project");
+        assert!(!s.history.can_undo() && !s.history.can_redo());
+        assert!(!s.is_dirty());
+    }
+}
+
+#[test]
+fn failed_save_as_preserves_the_project_and_its_original_path() {
+    let dir = crate::temp_dir().join(format!("fc-failed-save-as-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Original.fcproj");
+    let rejected = dir.join("Rejected.fcproj");
+    std::fs::create_dir_all(&rejected).unwrap();
+    let mut s = demo();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    s.execute("file.newBin", json!({"name": "Unsaved work"})).unwrap();
+    let before = s.project.clone();
+    let original_path = s.path.clone();
+    let revisions = (s.revision, s.saved_revision);
+    let result = s.execute("file.saveAs", json!({"path": rejected}));
+    std::fs::remove_dir_all(dir).unwrap();
+
+    assert!(result.is_err(), "saving over a directory must report the filesystem error");
+    assert!(*s.project == *before, "a failed Save As must not rename or mutate the document");
+    assert_eq!(s.path, original_path);
+    assert_eq!((s.revision, s.saved_revision), revisions);
+    assert!(s.is_dirty(), "unsaved work must remain dirty after a failed save");
 }
 
 /// Demo project with sync lock off on every track except V1/A1 (the A2 score spans every cut).

@@ -78,6 +78,9 @@ impl AudioOut {
             }
             let n = (self.end - pos).min(self.sr as i64) as usize;
             let buf = self.mix(pos, n, sources);
+            if filmcraft_media::pending::is_set() {
+                return Ok(());
+            }
             let refs: Vec<&[f32]> = buf.iter().map(Vec::as_slice).collect();
             meter.process(&refs);
             pos += n as i64;
@@ -126,6 +129,11 @@ impl AudioOut {
         let want_in = until + self.latency;
         let n_in = (want_in - self.next_in).max(0) as usize;
         let mut buf = self.mix(self.next_in, n_in, sources);
+        // A browser read may have returned an incomplete mix. Retry without consuming samples
+        // or advancing the limiter's delay line; the exporter observes the same pending flag.
+        if filmcraft_media::pending::is_set() {
+            return None;
+        }
         // the first call also fills the limiter's look-ahead
         let drop = (self.latency - (self.next_in - self.out)).clamp(0, n_in as i64) as usize;
         self.next_in = want_in;
@@ -145,6 +153,32 @@ impl AudioOut {
         Some(buf)
     }
 
+    /// Mix a whole batch transactionally, then partition it at the mux interleave boundaries.
+    /// Even a batch spanning several groups must not consume an earlier group if a later read
+    /// defers. Boundaries supplied by the exporter are increasing sample positions.
+    pub fn pull_groups(&mut self, boundaries: &[i64], sources: &dyn SourceProvider) -> Vec<Option<Vec<Vec<f32>>>> {
+        let mut pos = self.out;
+        let Some(&until) = boundaries.last() else { return Vec::new() };
+        let Some(planar) = self.pull(until, sources) else { return boundaries.iter().map(|_| None).collect() };
+        if boundaries.len() == 1 {
+            return vec![Some(planar)];
+        }
+        let mut offset = 0;
+        boundaries
+            .iter()
+            .map(|&boundary| {
+                let end = boundary.min(self.end).max(pos);
+                let n = (end - pos) as usize;
+                pos = end;
+                // pull produced exactly `until - old_out` samples on every channel, and these
+                // increasing, end-clamped boundaries partition that same interval.
+                let chunk = planar.iter().map(|c| c[offset..offset + n].to_vec()).collect();
+                offset += n;
+                (n > 0).then_some(chunk)
+            })
+            .collect()
+    }
+
     /// Everything still to come (to the end of the range).
     pub fn rest(&mut self, sources: &dyn SourceProvider) -> Option<Vec<Vec<f32>>> {
         self.pull(self.end, sources)
@@ -161,4 +195,75 @@ pub(crate) fn interleave(planar: &[Vec<f32>]) -> Vec<f32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filmcraft_frame::{AudioBuffer, VideoFrame};
+    use filmcraft_media::{FrameRequest, MediaInfo, MediaSource, SharedSource};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DeferredAudio {
+        source: SharedSource,
+        defer: AtomicBool,
+    }
+
+    impl MediaSource for DeferredAudio {
+        fn info(&self) -> &MediaInfo {
+            self.source.info()
+        }
+        fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+            self.source.video_frame(req)
+        }
+        fn audio(&self, start: i64, frames: usize, sr: u32) -> filmcraft_media::Result<AudioBuffer> {
+            if self.defer.swap(false, Ordering::Relaxed) {
+                return Err(filmcraft_media::MediaError::Io(filmcraft_media::pending::would_block().to_string()));
+            }
+            self.source.audio(start, frames, sr)
+        }
+    }
+
+    #[test]
+    fn deferred_reads_preserve_audio_and_limiter_state() {
+        for normalize in [false, true] {
+            let _ = filmcraft_media::pending::take();
+            let (project, seq, mut sources) = crate::tests::project();
+            let id = project.sequence(seq).unwrap().audio_tracks[0].items[0].item;
+            let source = sources.0.get(&id).unwrap().clone();
+            let mut settings = ExportSettings::default();
+            settings.effects.loudness.enabled = normalize;
+            let range = TimeRange::new(filmcraft_time::Tick::ZERO, filmcraft_time::FrameRate::FPS_24.tick_of(24));
+            let mut expected = AudioOut::new(project.clone(), seq, &settings, range).unwrap();
+            let mut actual = AudioOut::new(project, seq, &settings, range).unwrap();
+            let wanted = expected.pull(32_000, &sources).unwrap();
+            sources.0.insert(id, Arc::new(DeferredAudio { source, defer: AtomicBool::new(true) }));
+            assert!(actual.pull(32_000, &sources).is_none());
+            assert_eq!(actual.out, 0);
+            assert!(filmcraft_media::pending::take());
+            assert_eq!(actual.pull(32_000, &sources).unwrap(), wanted);
+            assert_eq!(actual.rest(&sources).unwrap(), expected.rest(&sources).unwrap());
+        }
+    }
+
+    #[test]
+    fn interleave_groups_retry_as_one_audio_transaction() {
+        let _ = filmcraft_media::pending::take();
+        let (project, seq, mut sources) = crate::tests::project();
+        let id = project.sequence(seq).unwrap().audio_tracks[0].items[0].item;
+        let source = sources.0.get(&id).unwrap().clone();
+        let mut settings = ExportSettings::default();
+        settings.effects.loudness.enabled = true;
+        let range = TimeRange::new(filmcraft_time::Tick::ZERO, filmcraft_time::FrameRate::FPS_24.tick_of(24));
+        let mut expected = AudioOut::new(project.clone(), seq, &settings, range).unwrap();
+        let mut actual = AudioOut::new(project, seq, &settings, range).unwrap();
+        let boundaries = [16_000, 32_000];
+        let wanted = expected.pull_groups(&boundaries, &sources);
+        sources.0.insert(id, Arc::new(DeferredAudio { source, defer: AtomicBool::new(true) }));
+        assert!(actual.pull_groups(&boundaries, &sources).iter().all(Option::is_none));
+        assert_eq!(actual.out, 0);
+        assert!(filmcraft_media::pending::take());
+        assert_eq!(actual.pull_groups(&boundaries, &sources), wanted);
+        assert_eq!(actual.rest(&sources).unwrap(), expected.rest(&sources).unwrap());
+    }
 }

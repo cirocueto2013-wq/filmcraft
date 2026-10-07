@@ -898,7 +898,7 @@ pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse
             for i in &mut tr.items {
                 if !clips.contains(&i.id) && i.start >= from {
                     // later clips must still end on the representable timeline
-                    let start = i.start.0.checked_add(shift.0).filter(|s| s.checked_add(i.duration.0).is_some());
+                    let start = i.start.0.checked_add(shift.0).filter(|s| s.checked_add(i.duration.0).is_some_and(|end| end <= Tick::MAX.0));
                     i.start = Tick(start.ok_or_else(|| EditError::Other("the speed change would move later clips past the end of the timeline".into()))?);
                 }
             }
@@ -908,6 +908,7 @@ pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse
     if ripple {
         transitions_follow_cuts(seq, &mut work);
     }
+    work.check().map_err(EditError::Other)?;
     *seq = work;
     Ok(())
 }

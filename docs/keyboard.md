@@ -43,6 +43,13 @@ Paste Insert in the Timeline, the Audio Track Mixer Loop).
 FilmCraft Default keeps its own keys where they differ (Shift+E is Clip ▸ Enable there, so Export
 Frame has no default key; the Premiere preset moves Shift+E to Export Frame and Enable to ⇧⌘E).
 
+On Windows and Linux, macOS Control and Command both become Ctrl. Built-in presets keep
+colliding actions accessible with separate keys: Cut to Camera 9 uses Ctrl+Shift+9, Add Range
+Marker uses Alt+R, Add Range Marker from In/Out uses Alt+Shift+R, and Toggle Trim Type uses
+Ctrl+Alt+T. The Final Cut preset's conflicting render shortcuts use Alt+Enter and Alt+Shift+Enter.
+These alternatives apply only when the original key conflicts; macOS and custom bindings retain
+their original keys. Keyboard Shortcuts and menus show the active binding.
+
 ## Skipped Premiere default shortcuts
 
 | Premiere command (key, scope) | Reason |

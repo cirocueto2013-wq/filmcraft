@@ -188,7 +188,7 @@ pub struct SoundInfo {
 impl SoundInfo {
     /// Bytes per sample frame of plain PCM.
     pub fn frame_bytes(&self) -> usize {
-        if self.block_align > 0 { self.block_align as usize } else { self.channels.max(1) as usize * (self.bits as usize).div_ceil(8).max(1) }
+        if self.block_align > 0 { self.block_align as usize } else { (self.channels.max(1) as usize).saturating_mul((self.bits as usize).div_ceil(8).max(1)) }
     }
 }
 
@@ -208,6 +208,9 @@ pub fn aes3_element_samples(v: &[u8]) -> usize {
 /// (bits 4-27 of the little-endian 32-bit word), first `channels` of the 8 channels.
 pub fn decode_pcm(v: &[u8], format: SoundFormat, channels: usize, bits: u32, frame_bytes: usize) -> Result<Vec<Vec<f32>>> {
     let ch = channels.max(1);
+    if ch > 256 {
+        return Err(crate::Error::Invalid("PCM channel count exceeds 256".into()));
+    }
     match format {
         SoundFormat::Pcm => {
             let bps = (bits as usize).div_ceil(8);
@@ -215,6 +218,9 @@ pub fn decode_pcm(v: &[u8], format: SoundFormat, channels: usize, bits: u32, fra
                 return Err(crate::Error::Unsupported(format!("{bits}-bit PCM with {frame_bytes}-byte frames")));
             }
             let n = v.len() / frame_bytes;
+            if n.checked_mul(ch).is_none_or(|n| n > 16_777_216) {
+                return Err(crate::Error::Invalid("PCM decode exceeds the sample buffer limit".into()));
+            }
             let mut out = vec![Vec::with_capacity(n); ch];
             let scale = 1.0 / (1u64 << (8 * bps - 1)) as f32;
             for i in 0..n {
@@ -233,6 +239,9 @@ pub fn decode_pcm(v: &[u8], format: SoundFormat, channels: usize, bits: u32, fra
             Ok(out)
         }
         SoundFormat::Aes3Element => {
+            if ch > 8 {
+                return Err(crate::Error::Invalid("an AES3 element has at most eight channels".into()));
+            }
             let n = aes3_element_samples(v);
             let mut out = vec![Vec::with_capacity(n); ch];
             for i in 0..n {

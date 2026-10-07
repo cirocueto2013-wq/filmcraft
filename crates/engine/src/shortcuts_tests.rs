@@ -72,6 +72,32 @@ fn defaults_follow_the_registry_and_the_premiere_audit() {
 }
 
 #[test]
+fn builtin_shortcuts_have_no_ambiguous_keys_on_any_platform() {
+    let mut s = Session::default();
+    with_ui_commands(&mut s);
+    // Export mode is a frontend command; its Cmd+M exposes another Control-key alias.
+    s.shortcuts.register_external(vec![CommandInfo::new("mode.export", "Export", &["File", "Export"], Some("Cmd+M"))]);
+    for platform in [Platform::Mac, Platform::Windows, Platform::Linux] {
+        for name in crate::shortcuts::BUILTIN_PRESETS {
+            let mut shortcuts = s.shortcuts.clone();
+            shortcuts.bindings = shortcuts.builtin_for_platform(name, platform).unwrap();
+            let conflicts = shortcuts.conflicts(platform);
+            assert!(conflicts.is_empty(), "{name} on {platform:?}: {conflicts:?}");
+            for binding in &shortcuts.bindings {
+                let chord = Chord::parse(&binding.keys).unwrap();
+                assert_eq!(
+                    shortcuts.resolve(&chord, binding.panel.as_deref(), platform).unwrap().command,
+                    binding.command,
+                    "{name} on {platform:?}: {} must run {}",
+                    binding.keys,
+                    binding.command,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn assign_reassigns_conflicts_and_undoes() {
     let mut s = Session::default();
     let r = s.execute("shortcuts.set", json!({"command": "edit.undo", "keys": "Cmd+Shift+K"})).unwrap();

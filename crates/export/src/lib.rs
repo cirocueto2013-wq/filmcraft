@@ -290,8 +290,63 @@ impl std::fmt::Debug for OutputSink {
 
 /// An export's output file: on disk, or in memory for an [`OutputSink`].
 enum Out {
-    File(std::io::BufWriter<std::fs::File>),
+    File(StagedFile),
     Mem(std::io::Cursor<Vec<u8>>),
+}
+
+/// Stream beside the destination and publish only after successful encoding and flush. Dropping
+/// an incomplete export removes its private staging file, leaving an existing destination intact.
+struct StagedFile {
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    temporary: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    published: bool,
+}
+
+impl StagedFile {
+    fn create(path: &str) -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let destination = std::path::PathBuf::from(path);
+        let parent = destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        for _ in 0..128 {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let temporary = parent.join(format!(".filmcraft-export-{}-{id}.part", std::process::id()));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
+                Ok(file) => return Ok(Self { writer: Some(std::io::BufWriter::new(file)), temporary, destination, published: false }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "unable to create a unique export staging file"))
+    }
+
+    fn writer(&mut self) -> std::io::Result<&mut std::io::BufWriter<std::fs::File>> {
+        self.writer.as_mut().ok_or_else(|| std::io::Error::other("export output is already closed"))
+    }
+
+    fn finish(mut self) -> std::io::Result<u64> {
+        let writer = self.writer()?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        let bytes = writer.get_ref().metadata()?.len();
+        // Close before rename/removal, including on Windows.
+        drop(self.writer.take());
+        std::fs::rename(&self.temporary, &self.destination)?;
+        self.published = true;
+        Ok(bytes)
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        if !self.published
+            && let Err(e) = std::fs::remove_file(&self.temporary)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("filmcraft: unable to remove incomplete export {}: {e}", self.temporary.display());
+        }
+    }
 }
 
 impl Out {
@@ -304,8 +359,8 @@ impl Out {
         if settings.sink.is_some() {
             return Ok(Out::Mem(std::io::Cursor::new(Vec::new())));
         }
-        let f = std::fs::File::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
-        Ok(Out::File(std::io::BufWriter::new(f)))
+        let f = StagedFile::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
+        Ok(Out::File(f))
     }
 
     /// Flush (and hand in-memory output to the sink); returns the file size.
@@ -315,10 +370,7 @@ impl Out {
 
     fn finish_path(self, settings: &ExportSettings, path: &str) -> Result<u64> {
         match self {
-            Out::File(mut w) => {
-                w.flush().map_err(|e| ExportError::Io(e.to_string()))?;
-                Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-            }
+            Out::File(w) => w.finish().map_err(|e| ExportError::Io(format!("{path}: {e}"))),
             Out::Mem(c) => write_output(settings, path, c.into_inner()),
         }
     }
@@ -329,7 +381,11 @@ fn write_output(settings: &ExportSettings, path: &str, data: Vec<u8>) -> Result<
     let n = data.len() as u64;
     match &settings.sink {
         Some(sink) => (sink.0)(path, data),
-        None => std::fs::write(path, &data),
+        None => {
+            let mut output = Out::create_path(settings, path)?;
+            output.write_all(&data).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
+            return output.finish_path(settings, path);
+        }
     }
     .map_err(|e| ExportError::Io(e.to_string()))?;
     Ok(n)
@@ -338,13 +394,13 @@ fn write_output(settings: &ExportSettings, path: &str, data: Vec<u8>) -> Result<
 impl Write for Out {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Out::File(w) => w.write(buf),
+            Out::File(w) => w.writer()?.write(buf),
             Out::Mem(w) => w.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Out::File(w) => w.flush(),
+            Out::File(w) => w.writer()?.flush(),
             Out::Mem(w) => w.flush(),
         }
     }
@@ -353,7 +409,7 @@ impl Write for Out {
 impl std::io::Seek for Out {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match self {
-            Out::File(w) => w.seek(pos),
+            Out::File(w) => w.writer()?.seek(pos),
             Out::Mem(w) => w.seek(pos),
         }
     }
@@ -449,6 +505,23 @@ impl Default for ExportSettings {
 impl ExportSettings {
     /// Reject settings the encoders cannot honour.
     pub fn validate(&self) -> Result<()> {
+        if let Some(range) = self.range {
+            validate_range(range)?;
+        }
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(ExportError::Unsupported("output scale must be finite and positive".into()));
+        }
+        if let Some((width, height)) = self.frame_size {
+            filmcraft_project::validate_frame_size(width, height).map_err(ExportError::Unsupported)?;
+        }
+        if let Some(rate) = self.frame_rate
+            && (rate.num <= 0 || rate.den <= 0 || rate.as_f64() > 1000.0)
+        {
+            return Err(ExportError::Unsupported("output frame rate must be positive and at most 1000 fps".into()));
+        }
+        if self.audio.sample_rate.is_some_and(|rate| rate == 0 || rate > 384_000) {
+            return Err(ExportError::Unsupported("output sample rate must be between 1 and 384000 Hz".into()));
+        }
         if self.field_order != FieldOrder::Progressive && self.has_video() {
             return Err(ExportError::Unsupported(format!("{} field order: FilmCraft's encoders write progressive frames", self.field_order.label())));
         }
@@ -1083,12 +1156,28 @@ fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSetti
 pub fn export_range(project: &Project, seq: ItemId, settings: &ExportSettings) -> Result<TimeRange> {
     let q = project.sequence(seq).ok_or(ExportError::NoSequence)?;
     if let Some(r) = settings.range {
+        validate_range(r)?;
         return Ok(r);
     }
     let fd = q.settings.frame_rate.frame_duration();
     let a = q.mark_in.unwrap_or(Tick::ZERO);
-    let b = q.mark_out.map(|o| o + fd).unwrap_or(q.duration());
-    Ok(TimeRange::from_bounds(a, b.max(a + fd)))
+    let minimum_end = a.0.checked_add(fd.0).ok_or_else(|| ExportError::Unsupported("export In point overflows the time range".into()))?;
+    let b = match q.mark_out {
+        Some(out) => out.0.checked_add(fd.0).ok_or_else(|| ExportError::Unsupported("export Out point overflows the time range".into()))?,
+        None => q.duration().0,
+    };
+    let duration = b.max(minimum_end).checked_sub(a.0).ok_or_else(|| ExportError::Unsupported("export range duration overflows".into()))?;
+    let range = TimeRange::new(a, Tick(duration));
+    validate_range(range)?;
+    Ok(range)
+}
+
+/// Validate input time before frame/sample conversion or any `TimeRange::end` arithmetic.
+pub fn validate_range(range: TimeRange) -> Result<()> {
+    if range.start.0 < 0 || range.duration.0 <= 0 || range.start.0.checked_add(range.duration.0).is_none_or(|end| end > Tick::MAX.0) {
+        return Err(ExportError::Unsupported("export range must start at or after zero, have positive duration and end within supported time bounds".into()));
+    }
+    Ok(())
 }
 
 /// Output frames `[f0, f1)` of `range` at `rate` (frame `f` is at `rate.tick_of(f)`).

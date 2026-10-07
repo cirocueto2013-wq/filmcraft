@@ -157,11 +157,19 @@ pub fn essential_graphics(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect)
     if tab == "edit" {
         crate::panels::graphics::properties(app, ui, body);
     } else {
-        browse(app, ui, body);
+        browse(app, ui, body, "");
     }
 }
 
-fn browse(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
+/// Libraries uses the same local template library as Essential Graphics, with independent widget ids.
+pub fn libraries(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
+    let head = Rect::from_min_size(rect.min, vec2(rect.width(), 30.0));
+    ui.painter().text(head.min + vec2(10.0, 15.0), Align2::LEFT_CENTER, "Local graphics templates", Tokens::semibold(12.0), app.tokens.text);
+    let body = Rect::from_min_max(pos2(rect.min.x, head.max.y), rect.max);
+    browse(app, ui, body, "libraries.");
+}
+
+fn browse(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, prefix: &str) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let lib = cached_library(app, &ctx);
@@ -171,7 +179,7 @@ fn browse(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut cats: Vec<String> = lib.iter().map(|e| e.template.category.clone()).collect();
     cats.sort();
     cats.dedup();
-    let mut b = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 6.0))).id_salt("gfx-browse"));
+    let mut b = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 6.0))).id_salt(("gfx-browse", prefix)));
     b.set_clip_rect(rect);
     let st = &mut app.ui.gfx_templates;
     b.horizontal(|ui| {
@@ -289,7 +297,7 @@ fn browse(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         actions.push(("graphics.template.apply".into(), json!({"template": id})));
     }
     for (id, r, l) in elems {
-        app.auto.add(&id, r, &l);
+        app.auto.add(&format!("{prefix}{id}"), r, &l);
     }
     if install {
         let _ = route(app, &ctx, "graphics.template.install", &json!({}));

@@ -9,7 +9,7 @@
 // step; then every mode and a tiny window. `--media` must be reachable from the page (copy it next
 // to index.html). Prints a JSON report; exits non-zero on failure, including any Rust panic or
 // uncaught exception in the console.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readdirSync, statSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,6 +24,12 @@ const media = arg("media", "web-test.mp4");
 const chrome = arg("chrome", process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "google-chrome");
 const port = Number(arg("port", "9333"));
 const headless = !process.argv.includes("--headed");
+const ffprobe = arg("ffprobe", process.env.FILMCRAFT_FFPROBE);
+const ffmpeg = arg("ffmpeg", process.env.FILMCRAFT_FFMPEG);
+const expectedTone = Number(arg("tone", "0"));
+if (!Number.isFinite(expectedTone) || expectedTone < 0) throw new Error("--tone must be a positive frequency in Hz");
+const expectAudio = process.argv.includes("--expect-audio") || expectedTone > 0;
+if (process.env.FILMCRAFT_REQUIRE_ORACLES === "1" && (!ffprobe || !ffmpeg)) throw new Error("FFmpeg and FFprobe are required for media verification");
 mkdirSync(out, { recursive: true });
 const downloads = join(out, "downloads");
 mkdirSync(downloads, { recursive: true });
@@ -107,6 +113,20 @@ try {
   await connect();
   await send("Page.enable");
   await send("Runtime.enable");
+  // Observe the real output graph without replacing the worklet, source or destination.
+  await send("Page.addScriptToEvaluateOnNewDocument", { source: `
+    window.__fcAudioAnalyzers = [];
+    const NativeWorkletNode = window.AudioWorkletNode;
+    if (NativeWorkletNode) window.AudioWorkletNode = class extends NativeWorkletNode {
+      constructor(context, name, options) {
+        super(context, name, options);
+        const analyzer = context.createAnalyser();
+        analyzer.fftSize = 4096;
+        this.connect(analyzer);
+        window.__fcAudioAnalyzers.push({analyzer, rate: context.sampleRate});
+      }
+    };
+  ` });
   await send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: downloads }).catch(() => {});
   await send("Emulation.setDeviceMetricsOverride", { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false });
   const t0 = Date.now();
@@ -134,20 +154,97 @@ try {
   if (!imp.items || imp.items.length === 0) throw new Error("import failed: " + JSON.stringify(imp));
   const item = imp.items[0];
   // a sequence from the clip, then look at its first frames
-  report.steps.sequence = await js(`filmcraft.execute("file.newSequence", {fromItem: ${item}, name: "Web import"})`).catch((e) => ({ error: String(e) }));
+  report.steps.sequence = await js(`filmcraft.execute("file.newSequence", {fromItem: ${item}, name: "Web import"})`);
   await sleep(1500);
   await js("filmcraft.request('ui.playback', {action: 'play'})");
-  await sleep(1500);
+  const audioWindows = [];
+  for (let i = 0; i < 3; i++) {
+    await sleep(500);
+    audioWindows.push(await js(`(() => {
+      const entry = window.__fcAudioAnalyzers.at(-1);
+      if (!entry) return null;
+      const samples = new Float32Array(entry.analyzer.fftSize);
+      entry.analyzer.getFloatTimeDomainData(samples);
+      const rms = Math.sqrt(samples.reduce((sum, s) => sum + s*s, 0) / samples.length);
+      let re = 0, im = 0;
+      for (let k = 0; k < samples.length; k++) {
+        const phase = 2*Math.PI*${expectedTone || 440}*k/entry.rate;
+        re += samples[k]*Math.cos(phase); im += samples[k]*Math.sin(phase);
+      }
+      return {rms, toneHz: ${expectedTone || 440}, toneAmplitude: 2*Math.hypot(re, im)/samples.length, rate: entry.rate};
+    })()`));
+  }
   report.steps.importPlay = { ...(await js("filmcraft.inspect().then(i => ({playhead: i.playhead, playback: i.playback}))")), screenshot: await shot("03-imported") };
+  report.steps.importPlay.audioWindows = audioWindows;
+  if (expectAudio && !audioWindows.every(w => w && w.rms > 0.01)) throw new Error("Imported playback produced silent audio");
+  if (expectedTone && !audioWindows.every(w => w && w.toneAmplitude > w.rms * 0.8)) throw new Error("Imported playback did not preserve the expected tone");
+  if (!(report.steps.importPlay.playhead > 0)) throw new Error("imported playback did not advance");
   await js("filmcraft.request('ui.playback', {action: 'stop'})");
+
+  // Round-trip the edited document through the actual browser filesystem, including playhead.
+  await js('filmcraft.execute("playhead.set", {seconds: 0.5})');
+  const saved = await js('filmcraft.execute("sequence.inspect")');
+  await js('filmcraft.execute("file.saveAs", {path: "/projects/web-edit.fcproj"})');
+  await js('filmcraft.execute("file.closeProject")');
+  await js('filmcraft.execute("file.open", {path: "/projects/web-edit.fcproj"})');
+  const reopened = await js('filmcraft.execute("sequence.inspect")');
+  report.steps.project = { before: saved, after: reopened };
+  // Timeline selection is transient session state; document and saved playhead must match.
+  const document = ({ selection, ...sequence }) => sequence;
+  if (JSON.stringify(document(saved)) !== JSON.stringify(document(reopened))) throw new Error("browser save/reopen changed the sequence or playhead");
+  report.steps.project = { path: "/projects/web-edit.fcproj", playhead: reopened.playhead, preserved: true };
 
   // export H.264 (stepped job; the file is offered as a download)
   const ex = await js(`filmcraft.execute("file.exportMedia", {format: "h264", path: "/exports/web-export.mp4", bitrateKbps: 4000})`);
   const te = Date.now();
   await until(`filmcraft.execute("jobs.list").then(js => js.some(j => j.id === ${ex.job} && j.finished))`, 300000, 250);
   report.steps.export = { job: ex.job, ms: Date.now() - te, jobs: await js("filmcraft.execute('jobs.list')"), files: await js("filmcraft.files()") };
+  const job = report.steps.export.jobs.find(j => j.id === ex.job);
+  if (job.result?.error) throw new Error("export failed: " + job.result.error);
   await sleep(1000);
   report.steps.export.downloads = readdirSync(downloads).filter((f) => !f.endsWith(".crdownload")).map((f) => ({ f, bytes: statSync(join(downloads, f)).size }));
+  if (!report.steps.export.downloads.some(f => f.f.endsWith(".mp4") && f.bytes > 1000)) throw new Error("export did not download a valid-sized MP4");
+  if (ffprobe && ffmpeg) {
+    const run = (exe, args) => {
+      const result = spawnSync(exe, args, { maxBuffer: 64 * 1024 * 1024 });
+      if (result.error || result.status !== 0) throw new Error(`${exe}: ${result.error ?? result.stderr.toString()}`);
+      return result.stdout;
+    };
+    const source = join(out, "verified-source.mp4");
+    const response = await fetch(new URL(media, url));
+    if (!response.ok) throw new Error(`Cannot read verification source: ${response.status}`);
+    writeFileSync(source, Buffer.from(await response.arrayBuffer()));
+    const movie = join(downloads, report.steps.export.downloads.find(f => f.f.endsWith(".mp4")).f);
+    const probe = path => JSON.parse(run(ffprobe, ["-v", "error", "-show_streams", "-show_format", "-of", "json", path]));
+    const input = probe(source), output = probe(movie);
+    const video = output.streams.find(s => s.codec_type === "video");
+    const inputVideo = input.streams.find(s => s.codec_type === "video");
+    if (!video || video.width !== inputVideo.width || video.height !== inputVideo.height) throw new Error("Export changed the video geometry");
+    if (Math.abs(Number(video.duration) - Number(inputVideo.duration)) > 0.05) throw new Error("Export truncated the video");
+    const audio = output.streams.find(s => s.codec_type === "audio");
+    if (input.streams.some(s => s.codec_type === "audio")) {
+      if (!audio || Math.abs(Number(audio.duration) - Number(video.duration)) > 1 / audio.sample_rate + 0.000001) throw new Error("Export truncated or extended the audio track");
+      const decode = path => run(ffmpeg, ["-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "48000", "-f", "f32le", "pipe:1"]);
+      const before = decode(source), after = decode(movie);
+      const rms = (buf, start, count) => {
+        let sum = 0;
+        for (let i = 0; i < count; i++) {
+          const offset = (start + i) * 4;
+          if (offset + 4 > buf.length) throw new Error("Decoded audio ended before the verification window");
+          sum += buf.readFloatLE(offset) ** 2;
+        }
+        return Math.sqrt(sum / count);
+      };
+      const count = Math.min(9600, Math.floor(Number(video.duration) * 24000));
+      const windows = [0.1, 0.4, 0.7, 1].map(f => Math.max(0, Math.floor(Number(video.duration) * 48000 * f) - count));
+      report.steps.export.audioWindows = windows.map(start => {
+        const original = rms(before, start, count), exported = rms(after, start, count);
+        if (original > 0.001 && exported < original * 0.1) throw new Error(`Export lost audio at sample ${start}`);
+        return { start, original, exported };
+      });
+    }
+    report.steps.export.verifiedMedia = { video, audio, format: output.format };
+  }
   report.steps.export.screenshot = await shot("04-exported");
 
   // every top-level mode and a tiny window: these used to panic (temp_dir in Export mode, a dock

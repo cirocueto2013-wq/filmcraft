@@ -132,6 +132,23 @@ fn browse_search_apply_and_edit_template_properties() {
 }
 
 #[test]
+fn libraries_search_and_apply_local_templates() {
+    let mut d = Driver::demo("libraries");
+    d.ok("ui.panel.show", json!({"panel":"Libraries"}));
+    d.ok("ui.set", json!({"gfxTemplates":{"query":"credits"}}));
+    d.frames(4);
+    let id = "libraries.gfxTemplates.item.builtin:end-credits-roll";
+    assert!(d.ids("libraries.gfxTemplates.item.").contains(&id.to_string()));
+    let before = d.clips_named("End Credits – Roll").len();
+    d.exec("playhead.set", json!({"seconds":300}));
+    d.ok("ui.click", json!({"id":id}));
+    d.ok("ui.click", json!({"id":"libraries.gfxTemplates.apply"}));
+    d.frames(3);
+    assert_eq!(d.clips_named("End Credits – Roll").len(), before + 1);
+    d.shot("libraries-local-templates");
+}
+
+#[test]
 fn drag_template_onto_the_timeline() {
     let mut d = Driver::demo("drag");
     d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));

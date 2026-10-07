@@ -251,6 +251,11 @@ impl Exporter {
         let file = Out::create(&self.settings)?;
         let mut opts = WriterOptions::new(self.brand);
         opts.metadata = self.settings.metadata.udta();
+        // AAC access units include padding. An explicit presentation duration at the audio
+        // sample rate trims it without millisecond rounding or shifting the first sample.
+        if let Some(audio) = self.audio.as_ref().filter(|_| self.aenc.is_some()) {
+            opts.movie_timescale = audio.sr;
+        }
         let mut mux = Mp4Writer::new(file, opts).map_err(|e| ExportError::Io(e.to_string()))?;
         let mut vcfg = TrackConfig::new(self.venc.sample_entry(), self.venc.timescale());
         vcfg.media_start = self.venc.media_start();
@@ -260,6 +265,9 @@ impl Exporter {
             (Some(a), Some(enc)) => {
                 let mut c = TrackConfig::new(enc.sample_entry(), a.sr);
                 c.media_start = Some(enc.priming() as i64);
+                let range = export_range(&self.project, self.seq, &self.settings)?;
+                let samples = range.end().to_units_floor(i64::from(a.sr)).saturating_sub(range.start.to_units_floor(i64::from(a.sr))).max(0) as u64;
+                c.edits = vec![filmcraft_isobmff::Edit { segment_duration: samples, media_time: i64::from(enc.priming()), media_rate: 0x10000 }];
                 Some(mux.add_track(c).map_err(|e| ExportError::Io(e.to_string()))?)
             }
             (Some(a), None) => {
@@ -298,10 +306,10 @@ impl Exporter {
             let (f, end) = (self.next, (self.next + self.batch).min(self.f1));
             let pipe = &self.pipe;
             let frames: Vec<(Vec<u8>, Vec<f32>)> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources)).collect();
+            if filmcraft_media::pending::take() {
+                return Ok(Step::Pending);
+            }
             if self.first_pass {
-                if filmcraft_media::pending::take() {
-                    return Ok(Step::Pending);
-                }
                 self.encode(&frames, f)?;
                 progress.done.fetch_add((end - f) as u64, Ordering::Relaxed);
                 self.next = end;
@@ -310,13 +318,8 @@ impl Exporter {
             // the audio of every interleave group that ends in this batch (before encoding, so a
             // pending source can still make the batch run again)
             let cuts: Vec<i64> = (f + 1..=end).filter(|&g| (g - self.f0) % INTERLEAVE == 0).collect();
-            let mut mixed = Vec::with_capacity(cuts.len());
-            if let Some(sr) = self.audio.as_ref().map(|a| a.sr) {
-                for &g in &cuts {
-                    let until = self.sample_at_frame(g, sr);
-                    mixed.push(self.audio.as_mut().and_then(|a| a.pull(until, sources)));
-                }
-            }
+            let boundaries: Vec<i64> = self.audio.as_ref().map(|a| cuts.iter().map(|&g| self.sample_at_frame(g, a.sr)).collect()).unwrap_or_default();
+            let mixed = self.audio.as_mut().map(|a| a.pull_groups(&boundaries, sources)).unwrap_or_default();
             if filmcraft_media::pending::take() {
                 return Ok(Step::Pending);
             }

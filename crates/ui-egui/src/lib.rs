@@ -454,13 +454,18 @@ impl FilmcraftApp {
         self.frames.set_cache_budget(p.memory.frame_cache_mb as usize * (1 << 20));
         self.ui.play_after_render = p.timeline.play_after_rendering;
         if prev.as_ref().is_none_or(|q| q.audio_hardware != p.audio_hardware) {
+            if let Some(input) = self.session.voiceover.input.as_mut() {
+                input.configure_host(&p.audio_hardware.device_class);
+            }
             let rate = self.session.active_sequence().map(|q| q.settings.sample_rate);
-            let playing = self.playback.playing && self.playback.audio_clock;
+            let playing = self.playback.playing && self.playback.preroll.is_none();
             if let Some(a) = self.audio.as_mut() {
                 a.stop();
                 a.configure(&p.audio_hardware, rate);
             }
             if playing {
+                self.playback.anchor_tick = self.session.playhead();
+                self.playback.anchor_time = ctx.input(|i| i.time);
                 self.start_audio();
             }
         }
@@ -1545,5 +1550,60 @@ mod gpu_fallback_tests {
         assert_eq!(super::plan_side(&p), 1920);
         let p = FramePlan::Image(filmcraft_render::Image::new(800, 4000));
         assert_eq!(super::plan_side(&p), 4000);
+    }
+}
+
+#[cfg(test)]
+mod audio_recovery_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Device {
+        ready: bool,
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl AudioOut for Device {
+        fn sample_rate(&self) -> u32 {
+            48000
+        }
+        fn channels(&self) -> usize {
+            2
+        }
+        fn configure(&mut self, hardware: &filmcraft_engine::settings::AudioHardwarePrefs, _: Option<u32>) {
+            self.ready = hardware.default_output == "available";
+        }
+        fn start(&mut self, _: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
+            self.starts.fetch_add(1, Ordering::Relaxed);
+            if self.ready { Ok(48000) } else { Err("device unavailable".into()) }
+        }
+        fn stop(&mut self) {}
+        fn played_frames(&self) -> Option<u64> {
+            Some(0)
+        }
+    }
+
+    #[test]
+    fn changing_hardware_recovers_wall_clock_playback_without_rewinding() {
+        let mut session = Session::default();
+        session.execute("file.newSequence", json!({"width":16,"height":16})).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = FilmcraftApp::new(session);
+        let starts = Arc::new(AtomicUsize::new(0));
+        app.audio = Some(Box::new(Device { ready: false, starts: starts.clone() }));
+        app.apply_prefs(&ctx);
+        app.play(1.0);
+        app.end_preroll(0.0);
+        assert!(!app.playback.audio_clock);
+        app.session.set_playhead(Tick::from_seconds_f64(2.0));
+        app.session.prefs.audio_hardware.default_output = "available".into();
+        app.apply_prefs(&ctx);
+        assert_eq!(starts.load(Ordering::Relaxed), 2);
+        assert!(app.playback.audio_clock);
+        assert_eq!(app.playback.anchor_tick, app.session.playhead());
+        app.stop();
     }
 }

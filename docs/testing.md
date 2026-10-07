@@ -11,6 +11,29 @@ FILMCRAFT_REQUIRE_ORACLES=1 cargo test --workspace   # CI: missing ffmpeg fails 
 
 ## 1. Kinds of tests
 
+### Desktop and browser end-to-end checks
+
+With a display available (Xvfb is sufficient on Linux), start the built desktop application with
+`filmcraft --empty --no-recover --control 9876 --data-dir target/native-e2e/app-data`, then run
+`python3 apps/filmcraft/tests/e2e.py --out target/native-e2e`. The script generates original media
+with the external FFmpeg oracle, imports video/images/audio, trims/moves/splits linked clips,
+checks undo/redo and rapid seeks, plays, saves/closes/reopens including the playhead, exports,
+then independently decodes all frames and checks cut timing and audio frequencies. It also moves
+and relinks missing media, imports a broken file, and cancels an active export over an existing
+destination, checking that the previous file and staging cleanup survive.
+
+Build/serve the browser client with `cargo xtask web --dev --serve 8765`, copy a generated movie
+beside the served `index.html` as `web-test.mp4`, and run
+`node apps/filmcraft-web/tests/smoke.mjs --chrome chromium --media web-test.mp4`. Its report checks
+imported playback, browser save/close/reopen and successful MP4 download, all modes and a tiny
+window. Set `FILMCRAFT_FFPROBE` and `FILMCRAFT_FFMPEG` (or pass `--ffprobe` / `--ffmpeg`) to also
+verify the downloaded movie independently: video geometry/duration, full audio presentation
+duration, and decoded audio energy across the clip including its end. `FILMCRAFT_REQUIRE_ORACLES=1`
+requires both tools. Screenshots, reports and media stay in the selected output directory.
+The browser test observes the real AudioWorklet output with an analyser. `--expect-audio`
+requires audible imported playback; `--tone 440` also verifies a generated 440 Hz source during
+playback. The analyser forwards the existing graph unchanged and is installed by the test only.
+
 | Kind | Where | Examples |
 |---|---|---|
 | Unit | `src/` `#[cfg(test)]` modules, `src/tests.rs` | CABAC engines, VLC tables (prefix-freeness, Kraft sums), colour matrices, frame cache |
@@ -49,6 +72,14 @@ are never linked or shipped ([AGENTS.md](../AGENTS.md) §2).
 - If a tool is missing the test prints `SKIPPED (<test>): ffmpeg not found …` and passes. Set
   **`FILMCRAFT_REQUIRE_ORACLES=1`** (CI) to make every such skip a failure. In new tests use
   `let ff = filmcraft_testkit::require_ffmpeg!();` (also `require_ffprobe!`, `require_oracles!`).
+- APV tests need an FFmpeg/FFprobe build with APV support (`ffmpeg -codecs` must list `apv`).
+  Distribution builds such as FFmpeg 7.1 predate that support; configure newer external tools
+  with `FILMCRAFT_FFMPEG` and `FILMCRAFT_FFPROBE`. The older tools cannot verify APV exports.
+- `cargo run -p filmcraft --example audio_probe` exercises the actual desktop output adapter;
+  `-- --input` exercises capture. An ALSA PCM selected through `ALSA_CONFIG_PATH` can verify
+  integer-only devices without a physical card. `-- --input --check-tones` verifies a generated
+  440 Hz left / 880 Hz right input; `-- --expect-stream-error` verifies that a failed output
+  releases the playback clock. These checks use the production CPAL adapters.
 - Fixtures are generated on first use into `<workspace>/target/fixtures/<crate>/`
   (`filmcraft_testkit::fixtures_dir`; independent of `CARGO_TARGET_DIR`, so agents with private
   target dirs share them; `FILMCRAFT_FIXTURES_DIR` overrides the root) and reused afterwards.

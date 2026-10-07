@@ -223,11 +223,11 @@ pub struct EssenceTrack {
 impl EssenceTrack {
     /// First presented edit unit (stored position of the material package's zero point).
     pub fn first_edit_unit(&self) -> i64 {
-        (self.origin + self.start_position).max(0)
+        self.origin.saturating_add(self.start_position).max(0)
     }
     /// Total sound sample frames stored.
     pub fn stored_sample_frames(&self) -> u64 {
-        self.chunks.last().map_or(0, |c| c.first_sample + c.samples)
+        self.chunks.last().map_or(0, |c| c.first_sample.saturating_add(c.samples))
     }
     /// Sound sample frames per edit unit (rational), e.g. 48000/25.
     pub fn samples_per_edit_unit(&self) -> (i64, i64) {
@@ -752,6 +752,9 @@ pub fn open(src: &(impl ByteSource + ?Sized)) -> Result<MxfFile> {
 fn index_entries(index: &[IndexSegment], sid: u32) -> (Vec<Option<IndexEntry>>, u32) {
     let any = index.iter().any(|s| s.index_sid == sid);
     let segs: Vec<&IndexSegment> = index.iter().filter(|s| !any || s.index_sid == sid).collect();
+    // Index entries are optional hints. A corrupt start position must not pad a tiny file with
+    // millions of empty entries; a complete dense index cannot exceed its stored entry count.
+    let limit = segs.iter().fold(0usize, |n, s| n.saturating_add(s.entries.len()));
     let mut out: Vec<Option<IndexEntry>> = Vec::new();
     let mut eubc = 0;
     for s in segs {
@@ -759,8 +762,9 @@ fn index_entries(index: &[IndexSegment], sid: u32) -> (Vec<Option<IndexEntry>>, 
             eubc = s.edit_unit_byte_count;
         }
         for (k, e) in s.entries.iter().enumerate() {
-            let Ok(p) = usize::try_from(s.start_position + k as i64) else { continue };
-            if p > 50_000_000 {
+            let Some(position) = s.start_position.checked_add(k as i64) else { break };
+            let Ok(p) = usize::try_from(position) else { continue };
+            if p >= limit {
                 break;
             }
             if out.len() <= p {
@@ -872,7 +876,7 @@ fn build_pictures(
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let (entries, eubc) = index_entries(index, t.index_sid);
-    let expected = t.duration.map(|d| (d + t.first_edit_unit()).max(0) as usize);
+    let expected = t.duration.map(|d| d.saturating_add(t.first_edit_unit()).max(0) as usize);
     let clip = elements.len() == 1 && expected.is_none_or(|n| n > 1) && (eubc > 0 || entries.len() > 1);
     let mut samples: Vec<Sample> = Vec::new();
     if clip {
@@ -992,6 +996,9 @@ impl MxfFile {
     pub fn read_sample(&self, src: &(impl ByteSource + ?Sized), track: usize, i: usize) -> Result<Vec<u8>> {
         let t = self.tracks.get(track).ok_or_else(|| Error::Invalid(format!("no track {track}")))?;
         let s = t.samples.get(i).ok_or_else(|| Error::Invalid(format!("no sample {i}")))?;
+        if u64::from(s.size) > src.len().saturating_sub(s.offset) || s.size > 268_435_456 {
+            return Err(Error::Invalid("picture sample exceeds the source or frame buffer limit".into()));
+        }
         let mut v = vec![0u8; s.size as usize];
         src.read_at(s.offset, &mut v)?;
         Ok(v)
@@ -1003,25 +1010,41 @@ impl MxfFile {
         let t = self.tracks.get(track).ok_or_else(|| Error::Invalid(format!("no track {track}")))?;
         let si = t.sound.as_ref().ok_or_else(|| Error::Invalid("not a sound track".into()))?;
         let ch = si.channels.max(1) as usize;
+        if ch > 256 || frames.checked_mul(ch).is_none_or(|n| n > 16_777_216) {
+            return Err(Error::Invalid("sound request exceeds the channel or sample buffer limit".into()));
+        }
+        if t.sound_format == SoundFormat::Pcm && (si.bits == 0 || si.bits > 32) {
+            return Err(Error::Unsupported("invalid PCM bit depth or block alignment".into()));
+        }
+        let fb = if t.sound_format == SoundFormat::Pcm { si.frame_bytes() } else { 0 };
+        if t.sound_format == SoundFormat::Pcm && (fb == 0 || fb > 4096) {
+            return Err(Error::Unsupported("invalid PCM block alignment".into()));
+        }
         let mut out = vec![vec![0f32; frames]; ch];
-        let end = start + frames as u64;
-        let fb = si.frame_bytes();
-        let mut ci = t.chunks.partition_point(|c| c.first_sample + c.samples <= start);
+        let end = start.saturating_add(frames as u64);
+        let mut ci = t.chunks.partition_point(|c| c.first_sample.saturating_add(c.samples) <= start);
         while let Some(c) = t.chunks.get(ci) {
             if c.first_sample >= end {
                 break;
             }
             let a = start.max(c.first_sample);
-            let b = end.min(c.first_sample + c.samples);
+            let b = end.min(c.first_sample.saturating_add(c.samples));
             if b > a {
                 let decoded = match t.sound_format {
                     SoundFormat::Pcm => {
                         let off = c.offset + (a - c.first_sample) * fb as u64;
-                        let mut v = vec![0u8; ((b - a) as usize) * fb];
+                        let bytes = ((b - a) as usize)
+                            .checked_mul(fb)
+                            .filter(|&n| n <= 268_435_456)
+                            .ok_or_else(|| Error::Invalid("PCM chunk exceeds the buffer limit".into()))?;
+                        let mut v = vec![0u8; bytes];
                         src.read_at(off, &mut v)?;
                         decode_pcm(&v, SoundFormat::Pcm, ch, si.bits, fb)?
                     }
                     SoundFormat::Aes3Element => {
+                        if c.size > 268_435_456 {
+                            return Err(Error::Invalid("AES3 chunk exceeds the buffer limit".into()));
+                        }
                         let mut v = vec![0u8; c.size as usize];
                         src.read_at(c.offset, &mut v)?;
                         let all = decode_pcm(&v, SoundFormat::Aes3Element, ch, si.bits, 0)?;

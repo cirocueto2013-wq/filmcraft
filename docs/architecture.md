@@ -146,6 +146,10 @@ EffectInstance
 
 - **Graphic clips** ([graphics.md](graphics.md)) reference a `Graphic` canvas item; their text and
   shape layers are hidden `graphic_text` / `graphic_shape` effect instances on the track item.
+  Text ▸ Graphics lists and searches the active sequence's text layers, selects their clip and
+  layer, and edits Source Text through the same commands as Properties. Text undo coalescing is
+  scoped to a focused typing gesture on one clip/layer. Libraries browses and applies the existing
+  local graphic templates, using the same catalogue as Essential Graphics ▸ Browse.
 - Everything is plain serde data. `Sequence::check()` validates the invariants (no overlaps, unique
   ids), and the engine runs it after every sequence edit.
 - Timeline positions are sequence ticks; `source_in` and keyframes are in media time, so trims and
@@ -229,6 +233,9 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   every frame of the GOP. Sequential playback reuses the decoder. Decoders implement
   `codecs::VideoDecoder`. `register_video_decoder` puts a factory in front of the built-in ones, so a
   hardware decoder can take precedence. The GOP cache never holds its lock while decoding.
+- **Retiming.** Frame Sampling selects a decoded frame; Frame Blending interpolates linear-light
+  frames; Optical Flow estimates bounded bidirectional block displacement on reduced frames and
+  warps the originals before blending. Unreliable matches and cuts use zero displacement.
 - **Hardware decoding.** The apps (desktop, CLI / headless MCP, bench) call
   `filmcraft_platform::register()` at startup, which on macOS registers a VideoToolbox factory for
   `avcC` / `hvcC` streams (8 / 10-bit, 4:2:0 and 4:2:2; elsewhere it does nothing). The factory
@@ -398,7 +405,16 @@ stereo / mono track ──5.1 panner───┼─► 5.1 submix / 5.1 Mix ─�
 
 **Voice-over recording** (`engine::voiceover`, `audio.voiceover.*`). The record point R is the playhead, or the In point when In/Out are set (punch-in; punch-out at Out). Playback starts the pre-roll before it (C = max(0, R − pre-roll)) and the input is captured from C. When the UI's audio clock really starts, `audio.voiceover.sync` restarts the capture there. `audio.voiceover.stop` keeps the audio from R to min(stop, Out), writes a mono 32-bit float WAV `<Name> <n>.wav` (Scratch Disks ▸ Captured, else next to the project, else the data or temporary directory), imports it and overwrites it onto the record track at R as one undo step. The record track is the given one, else the record-armed one, else the first targeted one. Input goes through the `AudioInput` trait: cpal in the desktop app (`apps/filmcraft/src/audio_in.rs`, on its own thread), and `SyntheticInput` headless, which produces exactly the samples the timeline asks for so recordings land sample-accurately. Voice-Over Record Settings (Source, Input channel, Name, Countdown Sound Cues, Pre-/Post-roll) are preferences (`voiceOver`). The track header's microphone records or stops, and a right-click opens the settings dialog. Countdown beeps (1 kHz, 100 ms, each whole second of pre-roll and at R) are mixed into playback, an overlay counts down, and playback stops at Out + post-roll.
 
+The desktop input and output adapters negotiate floating point and signed/unsigned integer CPAL
+formats. Output device failure releases the hardware clock so playback can continue on its wall
+clock. Input failure is reported and cannot silently produce a successful take. The input worker
+is joined when stopped, and changing Audio Hardware's device class applies to discovery and the
+next take without destroying an active recording. A failed recording save retains the captured
+samples and original stop point for retry. Project replacement and capture restart are rejected
+until that take is saved or explicitly discarded in Voice-Over Record Settings.
+
 ### 5.1.3 Remix
+
 
 ```text
 clip media (source In … +duration) ─► audio_dsp::remix::analyze: spectral-flux onsets → tempo (autocorrelation, 50–200 BPM)
@@ -582,6 +598,12 @@ multi-camera clip = nested source + TrackItem::multicam {enabled, angle}
   a clip by the clip(s) its angle shows (outer effects carried over; linked pairs stay linked).
 
 ## 6. Export jobs (`filmcraft-export`)
+
+Native outputs are streamed to unique staging files beside the destination, flushed and synced,
+then renamed onto the destination on success. Cancellation or failure drops the incomplete staging
+file and preserves an existing output. This applies per output file, including stills and MXF
+companions; a numbered image sequence may retain frames that completed before cancellation.
+Browser outputs continue to use the host's in-memory output sink.
 
 ```text
 file.exportMedia {path, preset?, settings?, format?, range?, …}     export.quick {preset?, path?}

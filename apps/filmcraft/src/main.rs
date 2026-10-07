@@ -164,10 +164,9 @@ fn main() -> eframe::Result {
             {
                 app.set_wgpu(rs);
             }
-            if let Some(out) = audio::CpalOut::new() {
-                // Settings ▸ Audio Hardware is applied on the first frame (`apply_prefs`)
-                app.audio = Some(Box::new(out));
-            }
+            // Keep device selection available even when the default device is unavailable.
+            // Settings ▸ Audio Hardware is applied on the first frame (`apply_prefs`).
+            app.audio = Some(Box::new(audio::CpalOut::new()));
             app.hooks.pick_files = Some(Box::new(|exts: &[&str]| {
                 rfd::FileDialog::new().add_filter("Media", exts).pick_files().unwrap_or_default().into_iter().map(|p| p.to_string_lossy().to_string()).collect()
             }));

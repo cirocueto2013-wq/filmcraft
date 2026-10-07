@@ -5,6 +5,22 @@ use egui::{Align2, Color32, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2,
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
+/// Coalesce changes within one focus gesture; refocusing starts a new undo step.
+pub fn text_edit_merge(ui: &Ui, response: &Response) -> bool {
+    let key = response.id.with("typing-session");
+    if response.gained_focus() {
+        ui.data_mut(|d| d.remove::<bool>(key));
+    }
+    let merge = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+    if response.changed() {
+        ui.data_mut(|d| d.insert_temp(key, true));
+    }
+    if response.lost_focus() {
+        ui.data_mut(|d| d.remove::<bool>(key));
+    }
+    merge
+}
+
 /// Premiere "hot text": a blue number you drag horizontally to scrub, click to type.
 /// Returns (response, Some(new value) when changed).
 pub fn hot_number(ui: &mut Ui, id: egui::Id, value: f64, speed: f64, range: (f64, f64), decimals: usize, suffix: &str, t: &Tokens) -> (Response, Option<f64>) {

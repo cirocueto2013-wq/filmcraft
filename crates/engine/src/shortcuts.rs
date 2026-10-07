@@ -36,6 +36,17 @@ use crate::{EngineError, Session};
 
 pub const APPLICATION: &str = "Application";
 
+// macOS has separate Command and Control keys. These built-in Control shortcuts need distinct
+// alternatives on Windows/Linux when their primary-modifier counterpart is already bound.
+const CONTROL_FALLBACKS: &[(&str, &str)] = &[
+    ("multicam.cutToCamera9", "Cmd+Shift+9"),
+    ("markers.addRange", "Alt+R"),
+    ("markers.addRangeInOut", "Alt+Shift+R"),
+    ("trim.toggleType", "Cmd+Alt+T"),
+    ("sequence.renderEffectsInToOut", "Alt+Enter"),
+    ("sequence.renderInToOut", "Alt+Shift+Enter"),
+];
+
 /// Panels that can have panel-specific shortcuts (the shortcut editor's "Commands" menu).
 pub const PANELS: &[&str] = &[
     "Timeline",
@@ -583,6 +594,10 @@ impl Shortcuts {
 
     /// The bindings of a built-in preset.
     pub fn builtin(&self, name: &str) -> Option<Vec<Binding>> {
+        self.builtin_for_platform(name, Platform::current())
+    }
+
+    pub(crate) fn builtin_for_platform(&self, name: &str, platform: Platform) -> Option<Vec<Binding>> {
         let mut b = self.base_defaults();
         b.extend(self.audit());
         let table: Vec<Entry> = match name {
@@ -593,6 +608,23 @@ impl Shortcuts {
             _ => return None,
         };
         self.apply_table(&mut b, &table);
+        if !platform.is_mac() {
+            for i in 0..b.len() {
+                let binding = b.get(i)?;
+                let Some(chord) = binding.chord().filter(|c| c.mods.ctrl) else { continue };
+                let conflict = b.iter().any(|other| {
+                    other.command != binding.command
+                        && other.context() == binding.context()
+                        && other.chord().is_some_and(|c| c.effective(platform) == chord.effective(platform))
+                });
+                if conflict
+                    && let Some((_, keys)) = CONTROL_FALLBACKS.iter().find(|(command, _)| *command == binding.command)
+                    && let Some(binding) = b.get_mut(i)
+                {
+                    binding.keys = (*keys).into();
+                }
+            }
+        }
         Some(b)
     }
 

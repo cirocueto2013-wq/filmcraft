@@ -354,7 +354,7 @@ async fn main() {
             let out = a.opt("--out").unwrap_or("frame.png");
             s.set_playhead(filmcraft_time::Tick::from_seconds_f64(secs));
             let t0 = std::time::Instant::now();
-            let Some(img) = s.render_program(scale) else { fail("no sequence") };
+            let Some(img) = s.render_program(scale) else { fail("no sequence or invalid render dimensions/scale") };
             let dt = t0.elapsed();
             let png = filmcraft_automation::png_rgba(img.w as u32, img.h as u32, img.over_black_rgba8(), 0).unwrap_or_else(|e| fail(e));
             std::fs::write(out, png).unwrap_or_else(|e| fail(format!("{out}: {e}")));

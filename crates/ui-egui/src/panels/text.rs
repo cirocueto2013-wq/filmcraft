@@ -6,7 +6,8 @@
 //! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands).
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat};
+use filmcraft_project::graphic::{LayerContent, eval_layer, layer_display_name, layer_indices};
+use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat, ItemKind};
 use filmcraft_time::{TimeDisplay, format_time};
 use serde_json::{Value, json};
 
@@ -46,8 +47,88 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     match app.ui.text_tab.as_str() {
         "Captions" => captions(app, ui, body),
         "Transcript" => transcript(app, ui, body),
-        _ => crate::dock::placeholder(ui, body, &t, "Graphics text search arrives with M10.1–M10.2"),
+        "Graphics" => graphics(app, ui, body),
+        _ => captions(app, ui, body),
     }
+}
+
+/// Search and edit the actual text layers in sequence order. Layer ordinals are distinct from
+/// effect indices (Motion/Opacity and shape layers can precede a text layer).
+fn graphics(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
+    let t = app.tokens;
+    let Some(seq) = app.session.active_sequence().cloned() else {
+        crate::dock::placeholder(ui, rect, &t, "Open a sequence to work with graphics");
+        return;
+    };
+    if rect.width() < 32.0 || rect.height() < 40.0 {
+        return;
+    }
+    let mut rows = Vec::new();
+    let ph = app.session.playhead();
+    for (track, tr) in seq.video_tracks.iter().enumerate() {
+        for it in &tr.items {
+            let Some(ItemKind::Graphic { width, height, .. }) = app.session.project.item(it.item).map(|p| &p.kind) else { continue };
+            let mt = it.source_time_at(ph.clamp(it.start, it.end() - filmcraft_time::Tick(1)));
+            for (layer, ei) in layer_indices(&it.effects).into_iter().enumerate() {
+                let Some(effect) = it.effects.get(ei) else { continue };
+                let Some(spec) = eval_layer(effect, mt, (*width, *height)) else { continue };
+                let LayerContent::Text(text) = spec.content else { continue };
+                rows.push((it.start, track, it.id, layer, it.name.clone(), layer_display_name(effect, layer), text.text));
+            }
+        }
+    }
+    rows.sort_by_key(|r| (r.0, r.1, r.2, r.3));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(8.0)).id_salt("graphics-text-list"));
+    let width = child.available_width();
+    let resp = crate::widgets::search_field(&mut child, &mut app.ui.graphics_search, "Search graphics text", width, &t);
+    app.auto.add("text.graphics.search", resp.rect, "Search graphics text");
+    child.add_space(6.0);
+    let query = app.ui.graphics_search.to_lowercase();
+    let selection = app.session.state.selection.clone();
+    let selected_layers = app.session.state.graphic_layers.clone();
+    let mut actions = Vec::new();
+    let mut shown = 0;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("graphics-text-scroll").show(&mut child, |ui| {
+        ui.set_width(width);
+        for (start, track, clip, layer, clip_name, name, mut text) in rows {
+            let editor_id = egui::Id::new(("graphics-text", clip.0, layer));
+            let selected = selection.contains(&clip) && selected_layers.contains(&layer);
+            if !query.is_empty()
+                && !text.to_lowercase().contains(&query)
+                && !name.to_lowercase().contains(&query)
+                && !clip_name.to_lowercase().contains(&query)
+                && !ui.memory(|m| m.has_focus(editor_id))
+            {
+                continue;
+            }
+            shown += 1;
+            egui::Frame::NONE.fill(if selected { t.row_selected } else { t.row_alt }).inner_margin(6.0).corner_radius(3.0).show(ui, |ui| {
+                let time = format_time(start, seq.settings.frame_rate, seq.settings.drop_frame, TimeDisplay::Timecode, i64::from(seq.settings.sample_rate));
+                let r = ui.add(egui::Button::new(format!("{time} · V{} · {name}", track + 1)).frame(false));
+                app.auto.add(&format!("text.graphics.{clip}.{layer}.goto", clip = clip.0), r.rect, "Go to graphic text");
+                if r.clicked() {
+                    actions.push(("timeline.select".into(), json!({"clips": [clip.0]})));
+                    actions.push(("graphics.selectLayer".into(), json!({"clip": clip.0, "layers": [layer]})));
+                    actions.push(("playhead.set".into(), json!({"time": start.0})));
+                }
+                let r = ui.add(egui::TextEdit::multiline(&mut text).id(editor_id).desired_width(ui.available_width()).desired_rows(2).font(Tokens::ui(12.0)));
+                app.auto.add(&format!("text.graphics.{clip}.{layer}.text", clip = clip.0), r.rect, "Graphic text");
+                let merge = crate::widgets::text_edit_merge(ui, &r);
+                if r.changed() {
+                    actions.push(("graphics.setText".into(), json!({"clip": clip.0, "layer": layer, "text": text, "merge": merge})));
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if shown == 0 {
+            ui.label(if query.is_empty() {
+                "No text layers in this sequence. Create a title with the Type tool or Graphics and Titles menu."
+            } else {
+                "No matching graphics text."
+            });
+        }
+    });
+    run(app, ui, actions);
 }
 
 fn tool_button(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, icon: Icon, id: &str, label: &str, enabled: bool) -> bool {

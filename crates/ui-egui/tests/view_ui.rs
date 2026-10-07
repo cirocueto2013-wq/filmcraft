@@ -113,6 +113,54 @@ fn first_media_item(v: &Value) -> Option<u64> {
 }
 
 #[test]
+fn graphics_text_tab_search_select_edit_undo_and_reopen() {
+    let mut d = Driver::demo();
+    d.exec("file.newProject", json!({}));
+    d.exec("file.newSequence", json!({"width": 320, "height": 180, "fps": 24, "video": 2, "audio": 1}));
+    let a = d.exec("graphics.newShape", json!({"shape": "rectangle", "seconds": 0}))["clip"].as_u64().unwrap();
+    let layer = d.exec("graphics.newText", json!({"clip": a, "text": "Alpha title"}))["layer"].as_u64().unwrap();
+    assert_eq!(layer, 1, "a shape precedes the text layer");
+    let b = d.exec("graphics.newText", json!({"text": "Beta title", "seconds": 6}))["clip"].as_u64().unwrap();
+    d.ok("ui.panel.show", json!({"panel": "Text"}));
+    d.click("text.tab.Graphics");
+    let a_goto = format!("text.graphics.{a}.{layer}.goto");
+    let a_text = format!("text.graphics.{a}.{layer}.text");
+    let b_goto = format!("text.graphics.{b}.0.goto");
+    assert!(d.try_rect(&a_goto).is_some());
+    assert!(d.try_rect(&b_goto).is_some());
+    d.click("text.graphics.search");
+    d.ok("ui.type", json!({"text": "Alpha"}));
+    assert!(d.try_rect(&a_goto).is_some());
+    assert!(d.try_rect(&b_goto).is_none());
+    d.click(&a_goto);
+    assert_eq!(d.harness.state().session.state.selection, vec![filmcraft_project::ClipId(a)]);
+    assert_eq!(d.harness.state().session.state.graphic_layers, vec![1]);
+    assert_eq!(d.harness.state().session.playhead(), filmcraft_time::Tick::ZERO);
+    let before = d.harness.state().session.history.undo.len();
+    d.click(&a_text);
+    d.ok("ui.key", json!({"key": "A", "command": true}));
+    d.ok("ui.type", json!({"text": "Changed"}));
+    d.ok("ui.type", json!({"text": " title"}));
+    assert_eq!(d.harness.state().session.history.undo.len(), before + 1);
+    assert_eq!(d.exec("graphics.list", json!({"clip": a}))["layers"][1]["text"], "Changed title");
+    d.exec("edit.undo", json!({}));
+    assert_eq!(d.exec("graphics.list", json!({"clip": a}))["layers"][1]["text"], "Alpha title");
+    d.exec("edit.redo", json!({}));
+    d.click("text.graphics.search");
+    d.ok("ui.key", json!({"key": "A", "command": true}));
+    d.ok("ui.key", json!({"key": "Backspace"}));
+    d.click(&b_goto);
+    d.shot("graphics-text");
+    let path = std::env::temp_dir().join(format!("filmcraft-graphics-tab-{}.fcproj", std::process::id()));
+    d.exec("file.saveAs", json!({"path": path}));
+    d.exec("file.close", json!({}));
+    d.exec("file.open", json!({"path": path}));
+    assert_eq!(d.exec("graphics.list", json!({"clip": a}))["layers"][1]["text"], "Changed title");
+    assert_eq!(d.exec("graphics.list", json!({"clip": b}))["layers"][0]["text"], "Beta title");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn view_menu_resolutions_and_display_modes() {
     let mut d = Driver::demo();
     let menu = d.ok("ui.menu.list", json!({}));

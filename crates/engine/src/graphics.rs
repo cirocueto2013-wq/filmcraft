@@ -217,8 +217,22 @@ pub(crate) fn to_param(template: &ParamValue, id: &str, v: &Value) -> Option<Par
 /// Set properties `props` on a layer (keyframe-aware at time `tl`). Changing the text keeps
 /// per-character styles on their characters.
 pub(crate) fn set_props(s: &mut Session, clip: ClipId, eidx: usize, props: &serde_json::Map<String, Value>, tl: Tick, label: &str) -> Result<()> {
+    set_props_merged(s, clip, eidx, props, tl, label, None)
+}
+
+fn set_props_merged(
+    s: &mut Session,
+    clip: ClipId,
+    eidx: usize,
+    props: &serde_json::Map<String, Value>,
+    tl: Tick,
+    label: &str,
+    merge_key: Option<&str>,
+) -> Result<()> {
+    let sequence = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     let props = props.clone();
-    s.edit_sequence(label, |q, _, _| {
+    let apply = move |project: &mut filmcraft_project::Project, _: &mut crate::EditorState| {
+        let q = project.sequence_mut(sequence).ok_or(EngineError::NoSequence)?;
         let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
         let mt = it.source_time_at(tl.clamp(it.start, it.end() - Tick(1)));
         let e = it.effects.get_mut(eidx).ok_or_else(|| bad("graphics.set", "no such layer"))?;
@@ -238,8 +252,12 @@ pub(crate) fn set_props(s: &mut Session, clip: ClipId, eidx: usize, props: &serd
                 x.runs = filmcraft_project::graphic_design::adjust_runs(a, b, &x.runs);
             }
         }
-        Ok(())
-    })
+        q.check().map_err(EngineError::Other)
+    };
+    match merge_key {
+        Some(key) => s.edit_merged(label, key, apply),
+        None => s.edit(label, apply),
+    }
 }
 
 /// Layers of a graphic clip with their evaluated bounds (sequence/canvas pixels).
@@ -831,15 +849,15 @@ pub fn commands() -> Vec<CommandSpec> {
                 let clip = target_clip(s, p).ok_or_else(|| bad("graphics.setText", "no graphic clip"))?;
                 let (_, ei) = layer_effect_index(s, clip, p)?;
                 let text = str_p(p, "text").ok_or_else(|| bad("graphics.setText", "need `text`"))?.to_string();
-                let merge = p.get("merge").and_then(Value::as_bool).unwrap_or(false) && s.history.undo.last().is_some_and(|h| h.0 == "Edit Text");
+                if !p.get("merge").and_then(Value::as_bool).unwrap_or(false) {
+                    s.history.merge_key = None;
+                }
                 let mut props = serde_json::Map::new();
                 props.insert("text".into(), Value::String(text));
                 let ph = s.playhead();
-                set_props(s, clip, ei, &props, ph, "Edit Text")?;
-                if merge && s.history.undo.len() >= 2 {
-                    // keep the snapshot from before the typing session
-                    s.history.undo.pop();
-                }
+                let sequence = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+                let key = format!("graphic-text:{}:{}:{ei}", sequence.0, clip.0);
+                set_props_merged(s, clip, ei, &props, ph, "Edit Text", Some(&key))?;
                 Ok(Value::Null)
             },
         ),

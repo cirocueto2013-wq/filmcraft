@@ -197,10 +197,20 @@ impl MediaPool {
     }
 
     fn resolve(&self, p: &Project, item: ItemId, services: &dyn Services, proxies: bool) -> Option<SharedSource> {
+        let mut item = item;
+        for _ in 0..16 {
+            match &p.item(item)?.kind {
+                ItemKind::Subclip { parent, .. } => item = *parent,
+                _ => break,
+            }
+        }
         let it = p.item(item)?;
         let m = match &it.kind {
             ItemKind::Media(m) => m,
-            ItemKind::Subclip { parent, .. } => return self.resolve(p, *parent, services, proxies),
+            ItemKind::Subclip { .. } => {
+                log::warn!("media item {} has a cyclic or excessively deep subclip reference", item.0);
+                return None;
+            }
             _ => return None,
         };
         if proxies
@@ -398,6 +408,48 @@ mod tests {
         }
         fn reader(&self, _path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
             Some(Ok(Arc::new(filmcraft_media::reader::MemReader(self.0.clone()))))
+        }
+    }
+
+    #[test]
+    fn cyclic_subclips_do_not_recurse_in_media_or_rendering() {
+        let mut project = Project::new("damaged references");
+        let a = project.add_item(
+            "A",
+            filmcraft_project::Label::Iris,
+            ItemKind::Subclip {
+                parent: ItemId(999),
+                range: filmcraft_time::TimeRange::new(filmcraft_time::Tick::ZERO, filmcraft_time::Tick(1000)),
+                restrict_trims: false,
+            },
+            None,
+        );
+        let b = project.add_item(
+            "B",
+            filmcraft_project::Label::Iris,
+            ItemKind::Subclip {
+                parent: a,
+                range: filmcraft_time::TimeRange::new(filmcraft_time::Tick::ZERO, filmcraft_time::Tick(1000)),
+                restrict_trims: false,
+            },
+            None,
+        );
+        let pool = MediaPool::default();
+        for parent in [a, b] {
+            let ItemKind::Subclip { parent: reference, .. } = &mut project.item_mut(a).unwrap().kind else { panic!() };
+            *reference = parent;
+            assert!(pool.source_for(&project, a, &crate::FsServices).is_none());
+            assert!(pool.full_res_source(&project, a, &crate::FsServices).is_none());
+            assert!(crate::media_duration(&project, &pool, a).is_none());
+            assert!(filmcraft_render::source_size(&project, a).is_none());
+            assert!(project.resolve_media(a).is_none());
+            assert!(filmcraft_render::colorman::override_of(&project, a).is_none());
+            assert!(filmcraft_render::colorman::source_peak_nits(&project, a).is_none());
+            assert!(crate::sync::project_clip(&project, a).is_none());
+            let mut session = crate::Session { project: Arc::new(project.clone()), ..Default::default() };
+            session.state.project_selection = vec![a];
+            assert!(!session.is_enabled("file.mediaProperties"));
+            assert!(session.execute("transcript.generate", serde_json::json!({"items":[a.0]})).is_err());
         }
     }
 

@@ -212,20 +212,40 @@ fn aac_priming_edit() {
     let data = std::fs::read(&src).unwrap();
     let f = open(data.as_slice()).unwrap();
     let t = &f.tracks[0];
-    let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
-    let mut cfg = TrackConfig::new(t.entries[0].clone(), t.timescale);
-    cfg.media_start = Some(1024);
-    let k = w.add_track(cfg).unwrap();
-    for (i, s) in t.samples.iter().enumerate() {
-        let d = f.read_sample(data.as_slice(), 0, i).unwrap();
-        w.write_sample(k, WriteSample { data: &d, duration: s.duration, composition_offset: 0, is_sync: true }).unwrap();
+    for copy_tail_edit in [false, true] {
+        let mut opts = WriterOptions::new(Brand::Mp4);
+        if copy_tail_edit {
+            opts.movie_timescale = f.timescale;
+        }
+        let movie_ts = opts.movie_timescale;
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), opts).unwrap();
+        let mut cfg = TrackConfig::new(t.entries[0].clone(), t.timescale);
+        cfg.media_start = Some(1024);
+        if copy_tail_edit {
+            // New FFmpeg versions store full AAC access units and trim trailing padding with
+            // an edit. Copying that edit must preserve the exact presentation duration.
+            cfg.edits = t.edits.clone();
+        }
+        let k = w.add_track(cfg).unwrap();
+        for (i, s) in t.samples.iter().enumerate() {
+            let d = f.read_sample(data.as_slice(), 0, i).unwrap();
+            w.write_sample(k, WriteSample { data: &d, duration: s.duration, composition_offset: 0, is_sync: true }).unwrap();
+        }
+        let name = if copy_tail_edit { "aac_gapless.mp4" } else { "aac_priming.mp4" };
+        let out = out_dir().join(name);
+        std::fs::write(&out, w.finish().unwrap().into_inner()).unwrap();
+        decode_clean(&out);
+        let pk = packets(&out);
+        assert_eq!(int(&pk[0]["pts"]), Some(-1024));
+        if copy_tail_edit {
+            assert_eq!(int(&streams(&out)[0]["duration_ts"]), int(&streams(&src)[0]["duration_ts"]));
+        } else {
+            // media_start spans the remaining coded media, including any encoder tail padding.
+            let coded = t.samples.iter().map(|s| u64::from(s.duration)).sum::<u64>() - 1024;
+            let expected = coded * u64::from(movie_ts) / u64::from(t.timescale) * u64::from(t.timescale) / u64::from(movie_ts);
+            assert_eq!(int(&streams(&out)[0]["duration_ts"]), Some(expected as i64));
+        }
     }
-    let out = out_dir().join("aac_priming.mp4");
-    std::fs::write(&out, w.finish().unwrap().into_inner()).unwrap();
-    decode_clean(&out);
-    let pk = packets(&out);
-    assert_eq!(int(&pk[0]["pts"]), Some(-1024));
-    assert_eq!(int(&streams(&out)[0]["duration_ts"]), int(&streams(&src)[0]["duration_ts"]));
 }
 
 #[test]

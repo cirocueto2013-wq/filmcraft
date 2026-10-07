@@ -83,6 +83,42 @@ fn typing_coalesces_into_one_undo_step_and_props_set() {
 }
 
 #[test]
+fn typing_on_different_layers_has_separate_undo_steps() {
+    let mut s = demo();
+    let r = s.execute("graphics.newText", json!({"text": "First"})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    s.execute("graphics.newText", json!({"clip": clip.0, "text": "Second"})).unwrap();
+    let before = s.history.undo.len();
+    s.execute("graphics.setText", json!({"clip": clip.0, "layer": 0, "text": "One", "merge": true})).unwrap();
+    s.execute("graphics.setText", json!({"clip": clip.0, "layer": 1, "text": "Two", "merge": true})).unwrap();
+    assert_eq!(s.history.undo.len(), before + 2);
+    s.execute("edit.undo", json!({})).unwrap();
+    let ls = layers(&s, clip);
+    assert_eq!(text_of(&ls[0]), "One");
+    assert_eq!(text_of(&ls[1]), "Second");
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(text_of(&layers(&s, clip)[1]), "Two");
+}
+
+#[test]
+fn typing_at_the_history_limit_preserves_the_previous_edit() {
+    let mut s = demo();
+    let r = s.execute("graphics.newText", json!({"text": "Original"})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    let original = layers(&s, clip)[0].clone();
+    s.history.limit = 2;
+    s.execute("graphics.set", json!({"clip": clip.0, "props": {"fontSize": 140}})).unwrap();
+    for (i, text) in ["A", "AB", "ABC"].into_iter().enumerate() {
+        s.execute("graphics.setText", json!({"clip": clip.0, "text": text, "merge": i > 0})).unwrap();
+    }
+    assert_eq!(s.history.undo.len(), 2);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(text_of(&layers(&s, clip)[0]), "Original");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(layers(&s, clip)[0], original);
+}
+
+#[test]
 fn align_and_distribute_layers() {
     let mut s = demo();
     let (w, h) = {

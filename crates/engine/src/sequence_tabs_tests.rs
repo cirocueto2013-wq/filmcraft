@@ -72,6 +72,8 @@ fn a_saved_project_reopens_with_its_tabs_and_their_views() {
     s.execute("sequence.open", json!({"item": b.0})).unwrap();
     s.state.timeline_views.insert(main, view(12.5, 3.0));
     s.state.timeline_views.insert(b, view(400.0, 0.25));
+    s.state.playheads.insert(main, s.project.sequence(main).unwrap().frame_rate().tick_of(70));
+    s.state.playheads.insert(b, s.project.sequence(b).unwrap().frame_rate().tick_of(120));
     let dir = temp_dir("reopen");
     let path = dir.join("tabs.fcproj").to_string_lossy().to_string();
     s.execute("file.saveAs", json!({"path": path})).unwrap();
@@ -83,6 +85,7 @@ fn a_saved_project_reopens_with_its_tabs_and_their_views() {
     assert_eq!(t.state.timeline_views.get(&main), Some(&view(12.5, 3.0)));
     assert_eq!(t.state.timeline_views.get(&b), Some(&view(400.0, 0.25)));
     assert_eq!(t.state.timeline_views.get(&c), None, "a sequence that was never shown has no view");
+    assert_eq!(t.state.playheads, s.state.playheads, "every sequence retains its playhead, including beyond the last clip");
     assert!(t.drain_events().contains(&Event::OpenSequence(b)));
     assert!(!t.is_dirty());
 
@@ -129,6 +132,7 @@ fn a_damaged_view_in_a_project_file_is_cleaned_up_or_ignored() {
     let t = with_view(json!({
         "open_sequences": [c.0, 999_999, footage.0, c.0, b.0],
         "active_sequence": 999_999,
+        "playheads": {b.0.to_string(): -100, c.0.to_string(): 123_456, "999999": 10, footage.0.to_string(): 20},
         "sequences": {
             b.0.to_string(): {"pps": 1e300, "scroll": -5.0, "v_scroll": 1e30, "a_scroll": -1.0, "video_track_h": 0.0, "audio_track_h": 1e9},
             "999999": {"pps": 40.0, "scroll": 0.0, "video_track_h": 60.0, "audio_track_h": 56.0},
@@ -141,6 +145,9 @@ fn a_damaged_view_in_a_project_file_is_cleaned_up_or_ignored() {
     let v = t.state.timeline_views[&b];
     assert!(v.pps <= 1e5 && v.scroll == 0.0 && v.v_scroll <= 1e6 && v.a_scroll == 0.0);
     assert!(v.video_track_h >= 8.0 && v.audio_track_h <= 600.0);
+    assert_eq!(t.state.playheads.len(), 2);
+    assert_eq!(t.state.playheads[&b], Tick::ZERO);
+    assert_eq!(t.state.playheads[&c], t.project.sequence(c).unwrap().frame_rate().snap(Tick(123_456)));
 
     // not a view at all: the project opens as it does without one
     for junk in [json!("tabs"), json!([1, 2, 3]), json!({"open_sequences": "all"}), json!({"sequences": {"x": 1}}), json!(null)] {

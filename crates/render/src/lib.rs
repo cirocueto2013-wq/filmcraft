@@ -25,6 +25,7 @@ pub mod mask;
 pub mod mixer;
 pub mod multicam;
 pub mod offline;
+pub mod optical_flow;
 pub mod plan;
 pub mod preview;
 pub mod remix;
@@ -244,12 +245,7 @@ pub(crate) fn opacity_blend(item: &TrackItem, mt: Tick) -> (f32, Blend) {
 
 /// Size of an item's source at full resolution.
 pub fn source_size(project: &Project, item: ItemId) -> Option<(u32, u32)> {
-    match &project.item(item)?.kind {
-        ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width, v.height)),
-        ItemKind::Sequence(s) => Some((s.settings.width, s.settings.height)),
-        ItemKind::AdjustmentLayer { width, height, .. } | ItemKind::Graphic { width, height, .. } => Some((*width, *height)),
-        ItemKind::Subclip { parent, .. } => source_size(project, *parent),
-    }
+    project.source_size(item)
 }
 
 /// The Motion transform of an item at media time `mt`, mapping full-res source pixels to
@@ -378,7 +374,11 @@ pub(crate) fn base_layer(
                 Some((next_time, wgt)) => match src.video_frame(FrameRequest { time: next_time, scale: want }) {
                     Ok(f2) if f2.width == frame.width && f2.height == frame.height => {
                         let b = colorman::decode(project, item.item, &f2, n, &seq.settings.color);
-                        img.lerp(&b, wgt)
+                        if item.time_interpolation == filmcraft_project::TimeInterpolation::OpticalFlow {
+                            optical_flow::interpolate(img, &b, wgt)
+                        } else {
+                            img.lerp(&b, wgt)
+                        }
                     }
                     _ => img,
                 },
@@ -432,7 +432,6 @@ pub fn render_clip(
 /// its weight (0..1) at timeline `t`, or None when the exact media time falls on a source frame
 /// (or the clip plays at 100 %, is frame-held, or uses Frame Sampling).
 ///
-/// TODO(optical flow): motion-compensated interpolation; Optical Flow renders as Frame Blending.
 pub fn interpolation_blend(item: &TrackItem, t: Tick, src_rate: filmcraft_time::FrameRate) -> Option<(Tick, f32)> {
     if item.time_interpolation == filmcraft_project::TimeInterpolation::FrameSampling || item.frame_hold.is_some() {
         return None;

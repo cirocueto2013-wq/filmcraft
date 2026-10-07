@@ -209,6 +209,9 @@ impl CaptionTrack {
     /// Invariant check: captions sorted, positive duration, no overlaps.
     pub fn check(&self) -> Result<(), String> {
         for c in &self.captions {
+            if !crate::bounded_time_range(c.start, c.duration) {
+                return Err(format!("{}: caption {:?} is outside supported time bounds", self.name, c.id));
+            }
             if c.duration.0 <= 0 {
                 return Err(format!("{}: caption {:?} has non-positive duration", self.name, c.id));
             }
@@ -309,5 +312,24 @@ mod tests {
         assert!(t.check().is_ok());
         assert_eq!(CaptionFormat::from_name("cea608"), Some(CaptionFormat::Cea608));
         assert_eq!(CaptionFormat::from_name("CEA-708"), Some(CaptionFormat::Cea708));
+    }
+
+    #[test]
+    fn corrupt_caption_times_do_not_overflow_the_overlap_check() {
+        let mut track = CaptionTrack::new(TrackId(1), "Subtitles".into(), CaptionFormat::Subtitle);
+        for (id, start) in [(1, i64::MAX), (2, 10)] {
+            track.captions.push(Caption {
+                id: ClipId(id),
+                start: Tick(start),
+                duration: Tick(50),
+                text: String::new(),
+                speaker: None,
+                cue_id: None,
+                settings: String::new(),
+            });
+        }
+        let result = std::panic::catch_unwind(|| track.check());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
     }
 }

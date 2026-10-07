@@ -786,6 +786,17 @@ impl Track {
     }
     /// Invariant check: items do not overlap.
     pub fn check(&self) -> Result<(), String> {
+        // Validate before calling end(), including on a single-item track.
+        for item in &self.items {
+            if !bounded_time_range(item.start, item.duration) {
+                return Err(format!("{}: item {:?} is outside supported time bounds", self.name, item.id));
+            }
+        }
+        for transition in &self.transitions {
+            if !bounded_time_range(transition.start, transition.duration) {
+                return Err(format!("{}: transition {:?} is outside supported time bounds", self.name, transition.id));
+            }
+        }
         for w in self.items.windows(2) {
             if w[0].end() > w[1].start {
                 return Err(format!("{}: items {:?} and {:?} overlap", self.name, w[0].id, w[1].id));
@@ -844,6 +855,30 @@ impl Default for SequenceSettings {
             working_space: "Rec. 709".into(),
             color: filmcraft_color::ColorPipeline::REC709,
         }
+    }
+}
+
+/// Bound working-frame allocations while retaining standard 8K and wide panoramic frames.
+pub fn validate_frame_size(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 || u64::from(width) * u64::from(height) > 67_108_864 {
+        return Err("frame size must be positive, at most 16384 pixels per side and 67108864 pixels total".into());
+    }
+    Ok(())
+}
+
+impl SequenceSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_frame_size(self.width, self.height)?;
+        if self.frame_rate.num <= 0 || self.frame_rate.den <= 0 || self.frame_rate.as_f64() > 1000.0 {
+            return Err("frame rate must be positive and at most 1000 fps".into());
+        }
+        if self.sample_rate == 0 || self.sample_rate > 384_000 {
+            return Err("sample rate must be between 1 and 384000 Hz".into());
+        }
+        if self.par.0 == 0 || self.par.1 == 0 {
+            return Err("pixel aspect ratio must be positive".into());
+        }
+        Ok(())
     }
 }
 
@@ -976,6 +1011,12 @@ impl Sequence {
         v
     }
     pub fn check(&self) -> Result<(), String> {
+        self.settings.validate()?;
+        if self.mark_in.into_iter().chain(self.mark_out).any(|t| t < Tick::MIN || t > Tick::MAX)
+            || self.work_area.is_some_and(|r| !bounded_time_range(r.start, r.duration))
+        {
+            return Err("sequence marks or work area are outside supported time bounds".into());
+        }
         for t in self.all_tracks() {
             t.check()?;
         }
@@ -984,6 +1025,13 @@ impl Sequence {
         }
         Ok(())
     }
+}
+
+/// Bound persisted timeline arithmetic before any start + duration operation. Negative timeline
+/// positions remain supported; empty ranges are valid metadata (track items/captions also require
+/// a positive duration in their own invariant checks).
+pub(crate) fn bounded_time_range(start: Tick, duration: Tick) -> bool {
+    start >= Tick::MIN && start <= Tick::MAX && duration.0 >= 0 && start.0.checked_add(duration.0).is_some_and(|end| end <= Tick::MAX.0)
 }
 
 /// Project-level settings.
@@ -1156,6 +1204,9 @@ pub struct ProjectView {
     pub active_sequence: Option<ItemId>,
     #[serde(default)]
     pub sequences: BTreeMap<ItemId, SequenceView>,
+    /// Each sequence's last playhead, independent of the active tab and the edit history.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub playheads: BTreeMap<ItemId, Tick>,
 }
 
 /// A LUT imported into the project (`lut.import`). Lumetri refers to it as `lib:<id>`.
@@ -1491,6 +1542,24 @@ fn resolve_auto_points_sized(e: &mut EffectInstance, frame: (u32, u32), source: 
 }
 
 impl Project {
+    /// Resolve a media item through subclips, preserving the outermost subclip's media range.
+    /// Cycles, missing parents and chains beyond the renderer's depth limit are unavailable media.
+    pub fn resolve_media(&self, item: ItemId) -> Option<(ItemId, &MediaClip, Option<TimeRange>)> {
+        let mut id = item;
+        let mut range = None;
+        for _ in 0..16 {
+            match &self.item(id)?.kind {
+                ItemKind::Media(media) => return Some((id, media, range)),
+                ItemKind::Subclip { parent, range: span, .. } => {
+                    range.get_or_insert(*span);
+                    id = *parent;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Size in pixels of what an item shows: a media clip's picture, a sequence's frame, an
     /// adjustment layer or graphic; a subclip has the size of its parent. `None` without
     /// picture. This is the size the renderer centres a clip's "auto" anchor in.
@@ -1608,6 +1677,27 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_timeline_times_are_rejected_before_end_arithmetic() {
+        let (mut project, media, seq) = demo_project();
+        let rate = project.sequence(seq).unwrap().settings.frame_rate;
+        let range = TimeRange::new(Tick::ZERO, rate.tick_of(24));
+        let first = project.make_track_item(media, TrackKind::Video, Tick::ZERO, range, rate).unwrap();
+        let second = project.make_track_item(media, TrackKind::Video, rate.tick_of(24), range, rate).unwrap();
+        project.sequence_mut(seq).unwrap().video_tracks[0].items = vec![first, second];
+        for start in [Tick(i64::MAX), Tick(i64::MIN), Tick::MAX] {
+            project.sequence_mut(seq).unwrap().video_tracks[0].items[0].start = start;
+            let result = std::panic::catch_unwind(|| project.sequence(seq).unwrap().check());
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_err());
+        }
+        project.sequence_mut(seq).unwrap().video_tracks[0].items[0].start = Tick::ZERO;
+        for mark in [Tick(i64::MAX), Tick(i64::MIN)] {
+            project.sequence_mut(seq).unwrap().mark_out = Some(mark);
+            assert!(project.sequence(seq).unwrap().check().is_err());
+        }
+    }
+
+    #[test]
     fn point_params_keep_auto_through_json_and_no_other_point_reads_null() {
         // serde_json writes NaN as `null`; a point parameter reads it back as NaN ("auto")
         let json = serde_json::to_string(&ParamValue::Vec2(Vec2::new(f64::NAN, 540.0))).unwrap();
@@ -1641,6 +1731,8 @@ mod tests {
         assert_eq!(p.source_size(clip), Some((src.width, src.height)));
         assert_eq!((p.source_size(sub), p.source_size(sub_of_sub)), (p.source_size(clip), p.source_size(clip)), "a subclip has its parent's size");
         assert_eq!(p.source_size(ItemId(987_654_321)), None);
+        assert_eq!(p.resolve_media(clip).map(|(id, _, span)| (id, span)), Some((clip, None)));
+        assert_eq!(p.resolve_media(sub_of_sub).map(|(id, _, span)| (id, span)), Some((clip, Some(second))));
         // clips whose Motion position / anchor were never resolved (as an interchange import builds them)
         let mut ids = Vec::new();
         for (n, item) in [clip, sub, sub_of_sub].into_iter().enumerate() {
