@@ -314,8 +314,63 @@ impl std::fmt::Debug for OutputSink {
 
 /// An export's output file: on disk, or in memory for an [`OutputSink`].
 enum Out {
-    File(std::io::BufWriter<std::fs::File>),
+    File(StagedFile),
     Mem(std::io::Cursor<Vec<u8>>),
+}
+
+/// Stream beside the destination and publish only after successful encoding and flush. Dropping
+/// an incomplete export removes its private staging file, leaving an existing destination intact.
+struct StagedFile {
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    temporary: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    published: bool,
+}
+
+impl StagedFile {
+    fn create(path: &str) -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let destination = std::path::PathBuf::from(path);
+        let parent = destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        for _ in 0..128 {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let temporary = parent.join(format!(".filmcraft-export-{}-{id}.part", std::process::id()));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
+                Ok(file) => return Ok(Self { writer: Some(std::io::BufWriter::new(file)), temporary, destination, published: false }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "unable to create a unique export staging file"))
+    }
+
+    fn writer(&mut self) -> std::io::Result<&mut std::io::BufWriter<std::fs::File>> {
+        self.writer.as_mut().ok_or_else(|| std::io::Error::other("export output is already closed"))
+    }
+
+    fn finish(mut self) -> std::io::Result<u64> {
+        let writer = self.writer()?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        let bytes = writer.get_ref().metadata()?.len();
+        // Close before rename/removal, including on Windows.
+        drop(self.writer.take());
+        std::fs::rename(&self.temporary, &self.destination)?;
+        self.published = true;
+        Ok(bytes)
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        if !self.published
+            && let Err(e) = std::fs::remove_file(&self.temporary)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("filmcraft: unable to remove incomplete export {}: {e}", self.temporary.display());
+        }
+    }
 }
 
 impl Out {
@@ -328,8 +383,8 @@ impl Out {
         if settings.sink.is_some() {
             return Ok(Out::Mem(std::io::Cursor::new(Vec::new())));
         }
-        let f = std::fs::File::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
-        Ok(Out::File(std::io::BufWriter::new(f)))
+        let f = StagedFile::create(path).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
+        Ok(Out::File(f))
     }
 
     /// Flush (and hand in-memory output to the sink); returns the file size.
@@ -339,10 +394,7 @@ impl Out {
 
     fn finish_path(self, settings: &ExportSettings, path: &str) -> Result<u64> {
         match self {
-            Out::File(mut w) => {
-                w.flush().map_err(|e| ExportError::Io(e.to_string()))?;
-                Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-            }
+            Out::File(w) => w.finish().map_err(|e| ExportError::Io(format!("{path}: {e}"))),
             Out::Mem(c) => write_output(settings, path, c.into_inner()),
         }
     }
@@ -353,7 +405,11 @@ fn write_output(settings: &ExportSettings, path: &str, data: Vec<u8>) -> Result<
     let n = data.len() as u64;
     match &settings.sink {
         Some(sink) => (sink.0)(path, data),
-        None => std::fs::write(path, &data),
+        None => {
+            let mut output = Out::create_path(settings, path)?;
+            output.write_all(&data).map_err(|e| ExportError::Io(format!("{path}: {e}")))?;
+            return output.finish_path(settings, path);
+        }
     }
     .map_err(|e| ExportError::Io(e.to_string()))?;
     Ok(n)
@@ -362,13 +418,13 @@ fn write_output(settings: &ExportSettings, path: &str, data: Vec<u8>) -> Result<
 impl Write for Out {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Out::File(w) => w.write(buf),
+            Out::File(w) => w.writer()?.write(buf),
             Out::Mem(w) => w.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Out::File(w) => w.flush(),
+            Out::File(w) => w.writer()?.flush(),
             Out::Mem(w) => w.flush(),
         }
     }
@@ -377,7 +433,7 @@ impl Write for Out {
 impl std::io::Seek for Out {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match self {
-            Out::File(w) => w.seek(pos),
+            Out::File(w) => w.writer()?.seek(pos),
             Out::Mem(w) => w.seek(pos),
         }
     }
