@@ -75,6 +75,91 @@ pub struct BatchParams {
     pub stop_on_error: Option<bool>,
 }
 
+// AI tools keep a typed, deliberately small vocabulary; unrestricted command dispatch stays separate.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum AssistantAction {
+    #[serde(rename = "extract")]
+    Extract { start: f64, end: f64 },
+    #[serde(rename = "seek")]
+    Seek { time: f64 },
+    #[serde(rename = "split")]
+    Split { clip: u64, time: f64 },
+    #[serde(rename = "move")]
+    Move { clip: u64, start: f64, track: u64 },
+    #[serde(rename = "trim")]
+    Trim { clip: u64, edge: String, delta: f64 },
+    #[serde(rename = "gain")]
+    Gain { clip: u64, db: f64 },
+}
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantPreviewParams {
+    pub instruction: Option<String>,
+    pub actions: Option<Vec<AssistantAction>>,
+    /// Local RMS/transcript analysis (default true); false uses the configured cloud/local model.
+    pub local: Option<bool>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiTokenParams {
+    pub token: u64,
+}
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiSettingsParams {
+    pub kokoro_url: Option<String>,
+    pub comfy_url: Option<String>,
+    pub planner_url: Option<String>,
+    pub model: Option<String>,
+    /// Session only. Omit to retain the current key; empty clears it. Never returned or saved.
+    pub api_key: Option<String>,
+}
+impl std::fmt::Debug for AiSettingsParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiSettingsParams")
+            .field("kokoro_url", &self.kokoro_url)
+            .field("comfy_url", &self.comfy_url)
+            .field("planner_url", &self.planner_url)
+            .field("model", &self.model)
+            .field("api_key", &"[redacted]")
+            .finish()
+    }
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiVoiceParams {
+    pub text: String,
+    pub voice: String,
+    pub language: String,
+    pub speed: Option<f64>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComfyParams {
+    pub workflow: Value,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiImportParams {
+    pub token: u64,
+    pub place: Option<bool>,
+    pub seconds: Option<f64>,
+    pub duration_seconds: Option<f64>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AutopilotParams {
+    pub instructions: Vec<String>,
+    pub apply: bool,
+    pub local: Option<bool>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TrainingParams {
+    pub instruction: String,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct RenderParams {
     /// Timeline time in seconds (default: the playhead).
@@ -311,6 +396,150 @@ impl FilmcraftMcp {
     )]
     async fn command_run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
         wrap(self.run(&p.id, p.params.unwrap_or(json!({}))).await)
+    }
+
+    #[tool(
+        title = "Configure AI services",
+        description = "Configure Kokoro, ComfyUI and an OpenAI-compatible editing planner. Keys stay in memory and are omitted from results. No request is made here.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn ai_configure(&self, Parameters(p): Parameters<AiSettingsParams>) -> Result<CallToolResult, McpError> {
+        let mut args = json!({});
+        for (k, v) in [("kokoroUrl", p.kokoro_url), ("comfyUrl", p.comfy_url), ("plannerUrl", p.planner_url), ("model", p.model), ("apiKey", p.api_key)] {
+            if let Some(v) = v {
+                args[k] = json!(v);
+            }
+        }
+        wrap(self.run("ai.configure", args).await)
+    }
+    #[tool(
+        title = "Inspect assistant context",
+        description = "Read bounded timeline metadata and transcript for editing planning. No network request.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn assistant_context(&self) -> Result<CallToolResult, McpError> {
+        wrap(self.run("assistant.context", json!({})).await)
+    }
+    #[tool(
+        title = "Preview assistant edit",
+        description = "Preview local analysis, a structured extract/seek plan, or a configured model proposal. Never applies edits. With local:false, timeline metadata/transcript goes to the configured planner. Inspect status, review ranges, then assistant_apply with its token.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn assistant_preview(&self, Parameters(p): Parameters<AssistantPreviewParams>) -> Result<CallToolResult, McpError> {
+        let mut args = json!({});
+        if let Some(text) = p.instruction {
+            args["instruction"] = json!(text);
+        }
+        if let Some(actions) = p.actions {
+            args["schemaVersion"] = json!(1);
+            args["actions"] = Value::Array(
+                actions
+                    .into_iter()
+                    .map(|a| match a {
+                        AssistantAction::Extract { start, end } => json!({"type":"extract","start":start,"end":end}),
+                        AssistantAction::Seek { time } => json!({"type":"seek","time":time}),
+                        AssistantAction::Split { clip, time } => json!({"type":"split","clip":clip,"time":time}),
+                        AssistantAction::Move { clip, start, track } => json!({"type":"move","clip":clip,"start":start,"track":track}),
+                        AssistantAction::Trim { clip, edge, delta } => json!({"type":"trim","clip":clip,"edge":edge,"delta":delta}),
+                        AssistantAction::Gain { clip, db } => json!({"type":"gain","clip":clip,"db":db}),
+                    })
+                    .collect(),
+            );
+        }
+        wrap(self.run(if p.local.unwrap_or(true) { "assistant.plan" } else { "ai.plan" }, args).await)
+    }
+    #[tool(
+        title = "Inspect assistant proposal",
+        description = "Advance analysis and report the current proposal, progress, validation errors and AI job status. Does not apply a reviewed proposal. An explicitly started Autopilot continues its authorized edits when polled.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn assistant_status(&self) -> Result<CallToolResult, McpError> {
+        let ai = self.run("ai.inspect", json!({})).await;
+        let assistant = self.run("assistant.inspect", json!({})).await;
+        wrap(match (ai, assistant) {
+            (Ok(ai), Ok(assistant)) => Ok(json!({"ai":ai,"assistant":assistant})),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        })
+    }
+    #[tool(
+        title = "Apply reviewed assistant edit",
+        description = "Apply the exact current review token as one undoable edit. Refuses stale proposals after any project edit or sequence change.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn assistant_apply(&self, Parameters(p): Parameters<AiTokenParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("assistant.apply", json!({"token":p.token})).await)
+    }
+    #[tool(
+        title = "List AI voices",
+        description = "Request available English/Spanish voices from the configured Kokoro server. Poll ai_job_status for results.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn ai_voices(&self) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.voices", json!({})).await)
+    }
+    #[tool(
+        title = "Generate AI narration",
+        description = "Generate real Kokoro speech (es/en), then poll ai_job_status. No edit until ai_import_media. Voice must match language (e* Spanish, a*/b* English).",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn ai_generate_voice(&self, Parameters(p): Parameters<AiVoiceParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.speak", json!({"text":p.text,"voice":p.voice,"language":p.language,"speed":p.speed.unwrap_or(1.0)})).await)
+    }
+    #[tool(
+        title = "Run ComfyUI workflow",
+        description = "Queue the actual graph exported by ComfyUI Export (API). Requires its models/nodes on the configured server. Poll ai_job_status; download outputs are capped and imported only explicitly.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn comfy_generate(&self, Parameters(p): Parameters<ComfyParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.comfy", json!({"workflow":p.workflow})).await)
+    }
+    #[tool(
+        title = "Test ComfyUI connection",
+        description = "Request system_stats from the configured ComfyUI server. Poll ai_job_status for the response.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn comfy_connect(&self) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.connectComfy", json!({})).await)
+    }
+    #[tool(
+        title = "Inspect AI job",
+        description = "Poll AI generation/planning and report ready media, token, errors or Autopilot progress. Polling continues an explicitly started Autopilot.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn ai_job_status(&self) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.inspect", json!({})).await)
+    }
+    #[tool(
+        title = "Import generated AI media",
+        description = "Validate and persist generated media, optionally place it at seconds on free unlocked spans, as one undo step. Refuses stale tokens and never overwrites clips.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn ai_import_media(&self, Parameters(p): Parameters<AiImportParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.import",json!({"token":p.token,"place":p.place.unwrap_or(false),"seconds":p.seconds.unwrap_or(0.0),"durationSeconds":p.duration_seconds.unwrap_or(5.0)})).await)
+    }
+    #[tool(
+        title = "Cancel AI work",
+        description = "Cancel analysis, discard proposals and stop Autopilot. ComfyUI cancellation targets only this job; older servers may continue a running remote job. Completed edits remain undoable.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn ai_cancel(&self) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.cancel", json!({})).await)
+    }
+    #[tool(
+        title = "Run editing Autopilot",
+        description = "Execute 1–8 instructions in order, using local analysis or the configured planner. Requires apply:true explicitly. Each task is validated and undoable. Stops on failure or an outside edit. Poll ai_job_status.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn editor_autopilot(&self, Parameters(p): Parameters<AutopilotParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.autopilot", json!({"instructions":p.instructions,"apply":p.apply,"local":p.local.unwrap_or(false)})).await)
+    }
+    #[tool(
+        title = "Export reviewed editing example",
+        description = "Return a training messages row for the current validated proposal and user instruction. Includes timeline/transcript: store only examples you have permission to train on. No training or upload happens.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn editor_training_example(&self, Parameters(p): Parameters<TrainingParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("ai.trainingExample", json!({"instruction":p.instruction})).await)
     }
 
     #[tool(
@@ -561,7 +790,7 @@ impl FilmcraftMcp {
     }
 }
 
-const INSTRUCTIONS: &str = "FilmCraft video editor (Premiere Pro-class). Every edit is an engine command: `command_list` to discover ids/params, `command_run` to execute (undoable; `command_batch` runs several). `doc_inspect` (or `project_inspect`/`sequence_inspect`) returns ids you can pass to commands; `render_preview` shows the result. In bridge mode the `ui_*` tools drive the live app: `ui_elements` lists clickable ids, `ui_click`/`ui_drag`/`ui_key` operate it, `ui_screenshot` shows it. Time is in ticks: 254016000000 per second (commands also accept `seconds`, `frame` or `timecode`).";
+const INSTRUCTIONS: &str = "FilmCraft video editor (Premiere Pro-class). AI: `ai_configure` selects services; `assistant_preview` proposes bounded edits, `assistant_status` reports ranges and a token, `assistant_apply` commits the reviewed plan. `ai_generate_voice`/`comfy_generate` return jobs; poll `ai_job_status`, then `ai_import_media`. `editor_autopilot` applies explicitly authorized bounded tasks. Every edit is an engine command: `command_list` to discover ids/params, `command_run` to execute (undoable; `command_batch` runs several). `doc_inspect` (or `project_inspect`/`sequence_inspect`) returns ids you can pass to commands; `render_preview` shows the result. In bridge mode the `ui_*` tools drive the live app: `ui_elements` lists clickable ids, `ui_click`/`ui_drag`/`ui_key` operate it, `ui_screenshot` shows it. Time is in ticks: 254016000000 per second (commands also accept `seconds`, `frame` or `timecode`).";
 
 /// Resources: the project (as `doc_inspect`) and the command catalog (as `command_list`).
 const DOCUMENT_URI: &str = "filmcraft://document";
@@ -723,6 +952,52 @@ mod tests {
         let mut s = Session::default();
         s.execute("file.openDemoProject", json!({})).unwrap();
         s
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ai_tools_are_real_typed_and_reviewed_over_stdio() {
+        let params = AiSettingsParams { api_key: Some("not-a-real-secret".into()), ..Default::default() };
+        assert!(!format!("{params:?}").contains("not-a-real-secret"));
+        let mut c = Client::start(demo());
+        c.init().await;
+        let tools = c.ask(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+        let names: Vec<_> = tools["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        for name in [
+            "ai_configure",
+            "assistant_context",
+            "assistant_preview",
+            "assistant_status",
+            "assistant_apply",
+            "ai_generate_voice",
+            "comfy_generate",
+            "comfy_connect",
+            "ai_job_status",
+            "ai_import_media",
+            "ai_cancel",
+            "editor_autopilot",
+            "editor_training_example",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
+        let r = c.call(2, "ai_configure", json!({"api_key":"not-a-real-secret"})).await;
+        assert_eq!(r["result"]["isError"], false);
+        assert!(!r.to_string().contains("not-a-real-secret"));
+        let r = c.call(3, "assistant_preview", json!({"actions":[{"type":"extract","start":1.0,"end":2.0}],"local":true})).await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let v: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let token = v["plan"]["token"].clone();
+        let r = c.call(4, "assistant_apply", json!({"token":token})).await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let r = c.call(5, "assistant_apply", json!({"token":token})).await;
+        assert_eq!(r["result"]["isError"], true);
+        let r = c.call(6, "ai_generate_voice", json!({"text":"hola","voice":"../../escape","language":"es"})).await;
+        assert_eq!(r["result"]["isError"], true);
+        let r = c.call(7, "editor_autopilot", json!({"instructions":["cut"],"apply":false})).await;
+        assert_eq!(r["result"]["isError"], true);
+        let r = c.call(8, "ai_import_media", json!({"token":1,"unexpected":true})).await;
+        assert_eq!(r["error"]["code"], -32602);
+        let r = c.call(9, "ai_cancel", json!({})).await;
+        assert_eq!(r["result"]["isError"], false);
     }
 
     /// Every listed tool has a title and the four hints, and the core tools are listed.

@@ -236,6 +236,16 @@ The trailer and the grades in these screenshots were built exactly this way, by 
 
 <br>
 
+## AI and MCP integrations
+
+The native editor can connect to Kokoro for Spanish/English narration, ComfyUI for workflow outputs,
+and OpenAI or an OpenAI-compatible editing planner. Previewed clip edits are validated and undoable;
+bounded Autopilot tasks and generation/import jobs also work through the existing MCP server.
+See [AI and MCP](docs/ai-and-mcp.md) for setup, supported actions, data handling and training examples.
+Models/services run externally and are not bundled; no fine-tuned model is included.
+
+<br>
+
 ## Everywhere
 
 - **Native** on macOS, Windows and Linux, with a native macOS menu bar.

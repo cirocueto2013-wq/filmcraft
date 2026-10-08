@@ -44,3 +44,8 @@ web-time = "1"
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Native AI clients use pure-Rust HTTP/TLS; the browser reports unsupported instead of spawning.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+rustls-rustcrypto = "0.0.2-alpha"
