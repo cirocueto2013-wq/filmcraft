@@ -38,6 +38,17 @@ mod windows {
 #[cfg(not(windows))]
 mod windows {
     pub fn embed_resources() {
+        println!("cargo:rerun-if-env-changed=FILMCRAFT_WINDOWS_RESOURCE_OBJECT");
+        if let Some(object) = std::env::var_os("FILMCRAFT_WINDOWS_RESOURCE_OBJECT") {
+            let path = std::path::Path::new(&object);
+            if !path.is_file() {
+                eprintln!("Windows resource object is missing: {}", path.display());
+                std::process::exit(1);
+            }
+            println!("cargo:rerun-if-changed={}", path.display());
+            println!("cargo:rustc-link-arg-bin=filmcraft={}", path.display());
+            return;
+        }
         println!("cargo:warning=filmcraft.exe built without icon/version resources (cross-compiled from a non-Windows host)");
     }
 }

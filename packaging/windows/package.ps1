@@ -21,9 +21,14 @@
 #>
 param(
   [ValidateSet('x64', 'x86', 'arm64')] [string] $Arch = 'x64',
-  [switch] $SkipBuild
+  [switch] $SkipBuild,
+  [switch] $AiBundle
 )
 $ErrorActionPreference = 'Stop'
+if ($AiBundle) {
+  & (Join-Path $PSScriptRoot 'package-ai.ps1') -Arch $Arch -SkipBuild:$SkipBuild
+  return
+}
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 
 function Invoke-Native([string] $What, [scriptblock] $Block) {

@@ -411,9 +411,13 @@ fn about_tab(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     crate::brand::paint_wordmark(ui, egui::pos2(r.min.x, r.center().y), 20.0, app.ui.dark);
     ui.add_space(6.0);
-    ui.heading("FilmCraft");
+    ui.heading(if crate::brand::IS_FORK { "FilmCraft AI" } else { "FilmCraft" });
     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-    ui.label("A clean-room, pure-Rust non-linear video editor. Part of the ArtCraft family.");
+    ui.label(if crate::brand::IS_FORK {
+        "Independent AI/MCP build, based on FilmCraft by the ArtCraft team."
+    } else {
+        "A clean-room, pure-Rust non-linear video editor. Part of the ArtCraft family."
+    });
     ui.add_space(10.0);
     let mut link = |ui: &mut egui::Ui, id: &str, icon: Icon, label: &str, url: &str, primary: bool| {
         let size = egui::vec2(ui.available_width(), if primary { 36.0 } else { 28.0 });
@@ -446,7 +450,14 @@ fn about_tab(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     link(ui, "website", Icon::Globe, "getartcraft.com", links::WEBSITE, false);
     link(ui, "appPage", Icon::Globe, "FilmCraft on getartcraft.com", links::APP_PAGE, false);
-    link(ui, "github", Icon::Code, "Source code on GitHub", links::GITHUB, false);
+    link(
+        ui,
+        "github",
+        Icon::Code,
+        "Source code on GitHub",
+        if crate::brand::IS_FORK { "https://github.com/cirocueto2013-wq/filmcraft/tree/feature/ai-and-mcp" } else { links::GITHUB },
+        false,
+    );
     link(ui, "reportIssue", Icon::Code, "Report an issue", links::ISSUES, false);
     ui.add_space(10.0);
     ui.label(egui::RichText::new("MIT OR Apache-2.0. Fonts: Inter, Noto Serif and JetBrains Mono (SIL OFL 1.1).").small().color(t.text_dim));

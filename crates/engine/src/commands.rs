@@ -633,30 +633,19 @@ fn build() -> Vec<CommandSpec> {
         // ================= File =================
         cmd!("file.newProject", "Project…", ["File", "New"], Some("Cmd+Alt+N"), r#"{"name":str}"#, always, |s, p| {
             let name = str_p(p, "name").unwrap_or("Untitled").to_string();
-            s.project = std::sync::Arc::new(filmcraft_project::Project::new(&name));
-            s.history = Default::default();
-            s.history.limit = 200;
-            s.state = crate::Session::default().state;
-            if s.path.take().is_some() {
-                s.previews.reset_temp();
-            }
-            s.revision += 1;
-            s.saved_revision = s.revision;
-            s.events.push(crate::Event::ProjectChanged { revision: s.revision });
+            install_project(s, filmcraft_project::Project::new(&name), None, true)?;
             Ok(Value::Null)
         }),
         cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, "{}", always, |s, _| {
-            let (p, seq) = crate::demo::demo_project(&s.media);
-            s.project = std::sync::Arc::new(p);
-            s.history = Default::default();
-            s.history.limit = 200;
-            s.state = crate::Session::default().state;
+            // Build into a separate pool: jobs rendering the old project may still hold its pool.
+            let media = std::sync::Arc::new(crate::MediaPool::default());
+            media.set_use_proxies(s.media.use_proxies());
+            let (p, seq) = crate::demo::demo_project(&media);
+            install_project(s, p, None, true)?;
+            s.media = media;
             s.state.active_sequence = Some(seq);
             s.state.open_sequences = vec![seq];
             s.state.playheads.insert(seq, FrameRate::FPS_23_976.tick_of(4 * 24 + 6));
-            s.revision += 1;
-            s.saved_revision = s.revision;
-            s.events.push(crate::Event::ProjectChanged { revision: s.revision });
             s.events.push(crate::Event::OpenSequence(seq));
             Ok(json!({"sequence": seq.0}))
         }),
@@ -3164,16 +3153,19 @@ fn name_project(p: &mut filmcraft_project::Project, name: String) {
 
 fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     let t0 = web_time::Instant::now();
+    // Stage Save As's new name until the atomic write succeeds. A failed write must leave the
+    // document, its original path and its dirty state intact.
+    let mut project = s.project.clone();
     // Save As renames the project after its new file (not an edit: no undo step, not dirty).
     if adopt
         && let Some(name) = project_name_for(path)
-        && s.project.name != name
+        && project.name != name
     {
-        name_project(std::sync::Arc::make_mut(&mut s.project), name);
+        name_project(std::sync::Arc::make_mut(&mut project), name);
     }
     // what is open (sequence tabs, how each is shown) goes into the file beside the project
     let view = s.project_view();
-    let bytes = filmcraft_format::encode_with_view(&s.project, Some(&view), false);
+    let bytes = filmcraft_format::encode_with_view(&project, Some(&view), false);
     let mut backup = None;
     if adopt && s.path.as_deref() == Some(path) && s.loaded_schema < filmcraft_format::SCHEMA_VERSION {
         let b = schema_backup_path(path, s.loaded_schema);
@@ -3186,6 +3178,7 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     }
     s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     if adopt {
+        s.project = project;
         s.path = Some(path.to_string());
         s.previews_follow_path();
         s.note_recent_project();
@@ -3201,7 +3194,10 @@ fn schema_backup_path(path: &str, schema: u32) -> String {
 }
 
 /// Make `proj` the session's project (fresh history, media pool and editor state).
-fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Option<String>, clean: bool) {
+pub(crate) fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Option<String>, clean: bool) -> Result<()> {
+    if s.voiceover.recording() {
+        return Err(EngineError::Other("save or discard the active voice-over take before replacing the project".into()));
+    }
     let proxies = s.media.use_proxies();
     s.media = std::sync::Arc::new(crate::MediaPool::default());
     s.media.set_use_proxies(proxies);
@@ -3217,6 +3213,8 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
         && !cfg!(target_arch = "wasm32")
     {
         s.previews.set_dir(Some(crate::project_tools::previews_dir_for(&s.project, p)));
+    } else {
+        s.previews.reset_temp();
     }
     s.path = path;
     s.revision += 1;
@@ -3224,13 +3222,14 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
     s.saved_revision = if clean { s.revision } else { 0 };
     s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
     s.events.push(crate::Event::ProjectChanged { revision: s.revision });
+    Ok(())
 }
 
 fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let (from, migrated) = (loaded.schema_version, loaded.migrated());
-    install_project(s, loaded.project, Some(path.to_string()), true);
+    install_project(s, loaded.project, Some(path.to_string()), true)?;
     if let Some(view) = loaded.view.filter(|_| s.prefs.timeline.restore_open_sequences) {
         s.restore_project_view(view);
     }
@@ -3257,7 +3256,7 @@ fn recover(s: &mut Session, id: Option<&str>) -> Result<Value> {
     let c = per.candidates[idx].clone();
     let saved_at = per.local_time(c.meta.saved_unix);
     let loaded = crate::autosave::load_candidate(&c).map_err(EngineError::Other)?;
-    install_project(s, loaded.project, c.meta.project_path.clone(), false);
+    install_project(s, loaded.project, c.meta.project_path.clone(), false)?;
     if let Some(seq) = s.state.active_sequence {
         s.events.push(crate::Event::OpenSequence(seq));
     }

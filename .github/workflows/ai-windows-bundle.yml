@@ -1,0 +1,61 @@
+name: Windows AI and Codex bundle
+on:
+  push:
+    branches: [build/windows-ai-bundle]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-ai-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    if: github.repository == 'cirocueto2013-wq/filmcraft'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: independent-ai-windows-x64
+      - name: Install WiX
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Build and package independent AI edition
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Arch x64 -AiBundle
+      - name: Install and verify actual MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem dist/ai/*.msi).FullName
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $msi + '"'), '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -notin 0,3010) { throw "MSI install failed: $($process.ExitCode)" }
+          $install = Join-Path $env:LOCALAPPDATA 'Programs/FilmCraftAI'
+          & (Join-Path $install 'Verify-Installation.ps1')
+          $process = Start-Process msiexec.exe -ArgumentList @('/x', ('"' + $msi + '"'), '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -notin 0,3010) { throw "MSI uninstall failed: $($process.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filmcraft-ai-windows-x64
+          path: |
+            dist/ai/*.msi
+            dist/ai/*.zip
+            dist/ai/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Publish downloadable independent prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'ai-mcp-windows-' + '${{ github.sha }}'.Substring(0,8)
+          $assets = @(Get-ChildItem dist/ai -File | Where-Object { $_.Extension -in '.msi','.zip' -or $_.Name -eq 'SHA256SUMS.txt' } | ForEach-Object { $_.FullName })
+          gh release create $tag --repo '${{ github.repository }}' --target '${{ github.sha }}' --prerelease `
+            --title 'FilmCraft AI + Codex — Windows x64' `
+            --notes 'Independent AI/MCP build. Includes MSI, portable ZIP and Spanish installation/Codex/service setup README. No models, credentials or service runtimes bundled.' `
+            @assets
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the prerelease failed.' }

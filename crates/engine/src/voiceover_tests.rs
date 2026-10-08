@@ -209,3 +209,18 @@ fn cue_times_count_down_whole_seconds() {
     assert_eq!(tone.len(), 4_800);
     assert!(tone.iter().all(|x| x.abs() <= 0.25) && tone[0] == 0.0);
 }
+
+#[test]
+fn replacing_the_project_cannot_lose_an_active_take() {
+    let (mut s, track, _) = demo();
+    s.execute("audio.voiceover.start", json!({"track":track})).unwrap();
+    let project = s.project.clone();
+    for command in ["file.newProject", "file.openDemoProject", "file.closeProject"] {
+        assert!(s.execute(command, json!({"force":true})).is_err(), "{command}");
+        assert!(s.voiceover.recording());
+        assert_eq!(s.project, project);
+    }
+    s.execute("audio.voiceover.stop", json!({"discard":true})).unwrap();
+    assert!(!s.voiceover.recording());
+    s.execute("file.newProject", json!({})).unwrap();
+}

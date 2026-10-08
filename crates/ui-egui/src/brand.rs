@@ -1,11 +1,16 @@
 //! The ArtCraft wordmark (first-party trademark, used with permission; see `docs/brand/` and
 //! AGENTS.md §1.8), decoded once and kept as a texture.
 
+pub const IS_FORK: bool = cfg!(filmcraft_fork);
+
+#[cfg(not(filmcraft_fork))]
 const LOGO_LIGHT_INK: &[u8] = include_bytes!("../../../docs/brand/artcraft-logo-white.png");
+#[cfg(not(filmcraft_fork))]
 const LOGO_DARK_INK: &[u8] = include_bytes!("../../../docs/brand/artcraft-logo.png");
 
 /// The wordmark for a dark (`dark = true`) or light UI: light ink on dark themes. Its aspect
 /// ratio is width / height of the returned texture.
+#[cfg(not(filmcraft_fork))]
 pub fn wordmark(ctx: &egui::Context, dark: bool) -> Option<egui::TextureHandle> {
     let id = egui::Id::new(("artcraft-wordmark", dark));
     if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
@@ -19,6 +24,12 @@ pub fn wordmark(ctx: &egui::Context, dark: bool) -> Option<egui::TextureHandle> 
     let tex = ctx.load_texture("artcraft-wordmark", color, egui::TextureOptions::LINEAR);
     ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
     Some(tex)
+}
+
+/// Independently distributed builds cannot embed the upstream trademark images.
+#[cfg(filmcraft_fork)]
+pub fn wordmark(_ctx: &egui::Context, _dark: bool) -> Option<egui::TextureHandle> {
+    None
 }
 
 /// Draw the wordmark `height` points tall with its left edge at `left_center` (vertically centred).

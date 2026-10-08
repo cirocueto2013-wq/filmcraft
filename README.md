@@ -244,6 +244,11 @@ bounded Autopilot tasks and generation/import jobs also work through the existin
 See [AI and MCP](docs/ai-and-mcp.md) for setup, supported actions, data handling and training examples.
 Models/services run externally and are not bundled; no fine-tuned model is included.
 
+**Windows AI build with Codex:** the independent MSI/portable bundle includes the modified app,
+MCP CLI, launchers, service setup scripts and a Spanish README for a local Codex installation.
+See [Windows AI + Codex setup](docs/windows-ai-setup.md). Codex can drive the editor using a
+ChatGPT subscription; the editor's direct OpenAI API connection is billed separately.
+
 <br>
 
 ## Everywhere

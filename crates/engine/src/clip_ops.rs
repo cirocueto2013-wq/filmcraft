@@ -808,16 +808,7 @@ fn close_project(s: &mut Session, p: &Value) -> Result<Value> {
     if s.is_dirty() && !bool_p(p, "force").unwrap_or(false) {
         return Err(EngineError::Other("the project has unsaved changes: save it first, or pass {\"force\": true} to discard them".into()));
     }
-    s.project = std::sync::Arc::new(Project::new("Untitled"));
-    s.history = Default::default();
-    s.history.limit = 200;
-    s.state = Session::default().state;
-    if s.path.take().is_some() {
-        s.previews.reset_temp();
-    }
-    s.revision += 1;
-    s.saved_revision = s.revision;
-    s.events.push(crate::Event::ProjectChanged { revision: s.revision });
+    crate::commands::install_project(s, Project::new("Untitled"), None, true)?;
     Ok(json!({"closed": true}))
 }
 

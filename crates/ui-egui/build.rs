@@ -13,6 +13,11 @@ use std::fmt::Write as _;
 use serde_json::Value;
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(filmcraft_fork)");
+    println!("cargo::rerun-if-env-changed=FILMCRAFT_FORK_BUILD");
+    if std::env::var("FILMCRAFT_FORK_BUILD").as_deref() == Ok("1") {
+        println!("cargo::rustc-cfg=filmcraft_fork");
+    }
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contributors");
     let json = read(&dir.join("contributors.json"), "the About window shows no contributors", |t| serde_json::from_str::<Value>(t).map_err(|e| e.to_string()))
         .unwrap_or(Value::Null);

@@ -1,0 +1,4 @@
+{
+  "1": { "class_type": "EmptyImage", "inputs": { "width": 160, "height": 90, "batch_size": 1, "color": 16711680 } },
+  "2": { "class_type": "SaveImage", "inputs": { "images": ["1", 0], "filename_prefix": "FilmCraft_AI_check" } }
+}

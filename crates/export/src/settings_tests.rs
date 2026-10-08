@@ -534,3 +534,49 @@ fn extreme_bitrates_do_not_overflow_encoder_setup() {
         assert!(result.unwrap().unwrap().is_err(), "an unrepresentable encoder buffer rate must be rejected");
     }
 }
+
+#[test]
+fn incomplete_exports_preserve_the_destination_and_clean_staging_files() {
+    let dir = Scratch::new("atomic-output");
+    let path = dir.path("previous.mp4");
+    std::fs::write(&path, b"previous export").unwrap();
+    let settings = ExportSettings { path: path.clone(), ..Default::default() };
+    let mut output = Out::create(&settings).unwrap();
+    output.write_all(b"incomplete new export").unwrap();
+    output.flush().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+    drop(output);
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+
+    let mut output = Out::create(&settings).unwrap();
+    output.write_all(b"completed new export").unwrap();
+    assert_eq!(output.finish(&settings).unwrap(), 20);
+    assert_eq!(std::fs::read(&path).unwrap(), b"completed new export");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+
+    let destination = dir.path("directory");
+    std::fs::create_dir(&destination).unwrap();
+    let mut output = Out::create_path(&settings, &destination).unwrap();
+    output.write_all(b"cannot replace a directory").unwrap();
+    assert!(output.finish_path(&settings, &destination).is_err());
+    assert!(std::path::Path::new(&destination).is_dir());
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 2);
+}
+
+#[test]
+fn cancelling_an_export_keeps_a_previous_file() {
+    let (project, seq, sources) = matte([1.0, 0.0, 0.0, 1.0], 64, 36, None);
+    let dir = Scratch::new("cancel-overwrite");
+    let path = dir.path("previous.mp4");
+    std::fs::write(&path, b"previous export").unwrap();
+    let settings = ExportSettings { path: path.clone(), ..Default::default() };
+    let progress = Progress::default();
+    let mut exporter = Exporter::new(project, seq, &settings, &progress).unwrap();
+    assert!(matches!(exporter.step(&sources, &progress).unwrap(), Step::Progress));
+    progress.cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(exporter.step(&sources, &progress), Err(ExportError::Cancelled)));
+    drop(exporter);
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+}
