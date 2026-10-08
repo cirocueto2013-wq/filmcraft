@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import struct
@@ -34,6 +35,30 @@ def pe(path, subsystem):
 def sha(path):
     with path.open('rb') as f:
         return hashlib.file_digest(f, 'sha256').hexdigest()
+
+
+def copy_font_licenses(stage):
+    for name in ('OFL-Inter.txt', 'OFL-NotoSerif.txt', 'OFL-JetBrainsMono.txt'):
+        shutil.copy2(ROOT / 'assets/fonts' / name, stage / name)
+    # egui's default fallback fonts remain embedded alongside FilmCraft's own faces.
+    lock = tomllib.loads((ROOT / 'Cargo.lock').read_text(encoding='utf-8'))
+    version = next(p['version'] for p in lock['package'] if p['name'] == 'epaint_default_fonts')
+    cargo_home = pathlib.Path(os.environ.get('CARGO_HOME', pathlib.Path.home() / '.cargo'))
+    cached = sorted((cargo_home / 'registry/src').glob(f'*/epaint_default_fonts-{version}/fonts'))
+    if not cached:
+        raise ValueError('Missing locked egui font licence texts; build the Windows binaries before packaging')
+    for name in ('OFL.txt', 'UFL.txt', 'emoji-icon-font-mit-license.txt'):
+        shutil.copy2(cached[0] / name, stage / ('egui-fonts-' + name))
+    if craft_dir := os.environ.get('CRAFT_FONTS_DIR'):
+        craft = pathlib.Path(craft_dir)
+        if not craft.is_absolute():
+            craft = ROOT / 'crates/text' / craft
+        licenses = sorted((craft / 'fonts').glob('*/OFL.txt'))
+        if not licenses:
+            raise ValueError('CRAFT_FONTS_DIR has no font licence texts')
+        for path in licenses:
+            shutil.copy2(path, stage / ('OFL-' + path.parent.name + '.txt'))
+        shutil.copy2(craft / 'ATTRIBUTION.md', stage / 'CRAFT-FONTS-ATTRIBUTION.md')
 
 
 def wix_document(stage, version, commit, fmt):
@@ -114,6 +139,7 @@ def main():
     for source, dest in [('docs/windows-ai-setup.md', 'README.md'), ('docs/ai-and-mcp.md', 'AI-MCP.md'),
                          ('LICENSE-MIT', 'LICENSE-MIT'), ('LICENSE-APACHE', 'LICENSE-APACHE'), ('ATTRIBUTION.md', 'ATTRIBUTION.md')]:
         shutil.copy2(ROOT / source, stage / dest)
+    copy_font_licenses(stage)
     info = {'name': 'FilmCraft AI', 'version': version, 'commit': commit, 'sourceDirty': dirty,
             'platform': 'windows-x64', 'aiAndMcp': True, 'forkBuild': True,
             'servicesBundled': False, 'files': {p.name: sha(p) for p in sorted(stage.iterdir()) if p.is_file()}}
